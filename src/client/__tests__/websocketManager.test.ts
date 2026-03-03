@@ -11,6 +11,7 @@ class FakeWebSocket {
 
   readyState = FakeWebSocket.CONNECTING
   sent: string[] = []
+  bufferedAmount = 0
   onopen: (() => void) | null = null
   onmessage: ((event: { data: string }) => void) | null = null
   onerror: (() => void) | null = null
@@ -75,7 +76,9 @@ function makeWindowMock() {
       return id
     },
     clearTimeout: (id: number) => {
+      // Per HTML spec, timer IDs share a namespace — clearTimeout can clear intervals too.
       timers = timers.filter((timer) => timer.id !== id)
+      intervals = intervals.filter((entry) => entry.id !== id)
     },
     setInterval: (callback: () => void, interval: number) => {
       const id = nextTimerId++
@@ -84,6 +87,7 @@ function makeWindowMock() {
     },
     clearInterval: (id: number) => {
       intervals = intervals.filter((entry) => entry.id !== id)
+      timers = timers.filter((timer) => timer.id !== id)
     },
     addEventListener: (event: string, handler: (...args: unknown[]) => void) => {
       if (event === 'pageshow') pageshowListeners.push(handler as (e: { persisted: boolean }) => void)
@@ -128,6 +132,20 @@ function fireSettleTimer() {
   const settle = timers.find((t) => t.delay === 750)
   expect(settle).toBeDefined()
   settle!.callback()
+}
+
+/** Fire the verification pong timeout timer (1500ms). */
+function fireVerifyTimer() {
+  const verify = timers.find((t) => t.delay === 1500)
+  expect(verify).toBeDefined()
+  verify!.callback()
+}
+
+/** Simulate a matching pong for the last ping sent on the given socket. */
+function respondWithPong(ws: FakeWebSocket) {
+  const lastPing = JSON.parse(ws.sent[ws.sent.length - 1]!)
+  expect(lastPing.type).toBe('ping')
+  ws.triggerMessage(JSON.stringify({ type: 'pong', seq: lastPing.seq }))
 }
 
 beforeEach(() => {
@@ -519,45 +537,52 @@ describe('forceReconnect via visibilitychange', () => {
     expect(FakeWebSocket.instances).toHaveLength(2)
   })
 
-  test('always force reconnects on resume even with healthy socket (no more verification ping)', () => {
+  test('verifies OPEN socket on resume instead of force-reconnecting', () => {
     const manager = new WebSocketManager()
     manager.connect()
     const ws = FakeWebSocket.instances[0]!
     ws.triggerOpen()
     manager.startLifecycleListeners()
 
-    // lastTick is recent — previously this would send a verification ping.
-    // Now ALL resumes force-reconnect with force=true.
     fireVisibilityChange('visible')
 
-    // Old socket should be destroyed
+    // Socket should NOT be destroyed — verify sends ping instead
+    expect(ws.onopen).not.toBeNull()
+    // Verification ping sent
+    expect(ws.sent).toHaveLength(1)
+    const ping = JSON.parse(ws.sent[0]!)
+    expect(ping.type).toBe('ping')
+    expect(ping.seq).toBe(1)
+    // Verify timer (1500ms) scheduled
+    expect(timers.some((t) => t.delay === 1500)).toBe(true)
+    // No settle timer (750ms) — that's only for force-reconnect
+    expect(timers.some((t) => t.delay === 750)).toBe(false)
+    // Still only one socket
+    expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+
+  test('verify timeout on resume triggers forceReconnect', () => {
+    const manager = new WebSocketManager()
+    manager.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.triggerOpen()
+    manager.startLifecycleListeners()
+
+    fireVisibilityChange('visible')
+
+    // Verify ping sent on existing socket
+    expect(ws.sent).toHaveLength(1)
+
+    // No pong arrives — fire the verify timeout (1500ms)
+    fireVerifyTimer()
+
+    // Now forceReconnect should have been called — old socket destroyed
     expect(ws.onopen).toBeNull()
-    // No verification ping sent on old socket
-    expect(ws.sent).toHaveLength(0)
 
     // Settle timer scheduled, fire it
     fireSettleTimer()
-    expect(FakeWebSocket.instances).toHaveLength(2)
-  })
 
-  test('force reconnects on suspended resume with healthy socket', () => {
-    const manager = new WebSocketManager()
-    manager.connect()
-    FakeWebSocket.instances[0]!.triggerOpen()
-    manager.startLifecycleListeners()
-
-    // Simulate suspension: lastTick far in the past (>10s gap)
-    ;(manager as unknown as { lastTick: number }).lastTick = Date.now() - 15_000
-
-    fireVisibilityChange('visible')
-
-    // Old socket handlers should be nulled
-    expect(FakeWebSocket.instances[0]!.onopen).toBeNull()
-
-    // Fire the settle delay timer to trigger connect
-    fireSettleTimer()
-
-    // Should have torn down and created a new socket despite OPEN+connected
+    // New socket created
     expect(FakeWebSocket.instances).toHaveLength(2)
   })
 
@@ -740,25 +765,29 @@ describe('forceReconnect resets backoff', () => {
 })
 
 describe('zombie OPEN socket detection', () => {
-  test('forceReconnect tears down OPEN socket when status is not connected', () => {
+  test('zombie OPEN socket detected via verify timeout', () => {
     const manager = new WebSocketManager()
     manager.connect()
     const ws = FakeWebSocket.instances[0]!
     ws.triggerOpen()
     manager.startLifecycleListeners()
 
-    // Simulate zombie: socket says OPEN but status diverged (e.g. reconnecting after timeout)
+    // Simulate zombie: socket says OPEN but status diverged
     ;(manager as unknown as { status: string }).status = 'reconnecting'
 
     fireVisibilityChange('visible')
 
-    // Old socket handlers should be nulled (torn down immediately)
+    // Verify ping sent (zombie appears OPEN)
+    expect(ws.sent).toHaveLength(1)
+
+    // Zombie doesn't respond — fire verify timeout
+    fireVerifyTimer()
+
+    // Old socket torn down
     expect(ws.onopen).toBeNull()
 
-    // Fire settle timer
+    // Fire settle timer → new socket
     fireSettleTimer()
-
-    // Should have destroyed the zombie and created a new socket
     expect(FakeWebSocket.instances).toHaveLength(2)
   })
 })
@@ -789,14 +818,12 @@ describe('scheduleReconnect while hidden', () => {
     FakeWebSocket.instances[0]!.triggerOpen()
     manager.startLifecycleListeners()
 
-    // Simulate suspension so the first call is forced
-    ;(manager as unknown as { lastTick: number }).lastTick = Date.now() - 15_000
+    // Socket died in background — non-OPEN → forceReconnect path
+    ;(manager as unknown as { ws: null }).ws = null
+    ;(manager as unknown as { status: string }).status = 'reconnecting'
 
-    // First call should force-reconnect (all resumes are now forced)
+    // First call should force-reconnect
     fireVisibilityChange('visible')
-    // Old socket destroyed
-    expect(FakeWebSocket.instances[0]!.onopen).toBeNull()
-    // Settle timer scheduled
     const settleTimer = timers.find((t) => t.delay === 750)
     expect(settleTimer).toBeDefined()
 
@@ -979,30 +1006,25 @@ describe('heartbeat ping/pong', () => {
 })
 
 describe('forceReconnect debounce', () => {
-  test('does not suppress forced pageshow(persisted=true) after forced visibilitychange', () => {
+  test('pageshow(persisted=true) force-reconnects even during active verification', () => {
     const manager = new WebSocketManager()
     manager.connect()
     FakeWebSocket.instances[0]!.triggerOpen()
     manager.startLifecycleListeners()
 
-    // All resumes are now forced — visibilitychange fires forceReconnect(force=true)
+    // visibilitychange → verify (OPEN socket)
     fireVisibilityChange('visible')
+    const ws = FakeWebSocket.instances[0]!
+    expect(ws.sent).toHaveLength(1) // verify ping sent
 
-    // Old socket torn down, settle timer scheduled
-    expect(FakeWebSocket.instances[0]!.onopen).toBeNull()
-    const settle1 = timers.find((t) => t.delay === 750)
-    expect(settle1).toBeDefined()
-
-    // Immediately fire pageshow(persisted=true) — within 200ms debounce window
-    // The second forced call should be debounced to avoid double reconnect
+    // Immediately fire pageshow(persisted=true) — always force-reconnects
     firePageShow(true)
 
-    // Still just one settle timer — second was debounced
-    const settleTimers = timers.filter((t) => t.delay === 750)
-    expect(settleTimers).toHaveLength(1)
+    // Socket destroyed by forceReconnect (cancels in-progress verify)
+    expect(ws.onopen).toBeNull()
 
-    // Fire settle timer, socket created
-    settle1!.callback()
+    // Fire settle timer → new socket
+    fireSettleTimer()
     expect(FakeWebSocket.instances).toHaveLength(2)
   })
 })
@@ -1017,12 +1039,11 @@ describe('lastTick normalization on resume', () => {
     // Set lastTick far in the past (20s ago) to simulate suspension
     ;(manager as unknown as { lastTick: number }).lastTick = Date.now() - 20_000
 
-    // visibilitychange should detect and force reconnect
+    // visibilitychange normalizes lastTick, then verifies (OPEN socket)
     fireVisibilityChange('visible')
-    // Old socket destroyed
-    expect(FakeWebSocket.instances[0]!.onopen).toBeNull()
 
-    // Fire the settle timer to create the new socket
+    // Simulate verify timeout → force reconnect
+    fireVerifyTimer()
     fireSettleTimer()
     expect(FakeWebSocket.instances).toHaveLength(2)
 
@@ -1058,7 +1079,7 @@ describe('lastTick frozen while hidden', () => {
     expect(tickAfter).toBe(tickBefore)
   })
 
-  test('frozen lastTick causes visibilitychange to force reconnect on resume', () => {
+  test('long hidden period followed by resume verifies then reconnects on timeout', () => {
     const manager = new WebSocketManager()
     manager.connect()
     FakeWebSocket.instances[0]!.triggerOpen()
@@ -1071,16 +1092,16 @@ describe('lastTick frozen while hidden', () => {
     fireVisibilityChange('hidden')
     fireAllIntervals()
 
-    // Come back visible — all resumes now force reconnect
+    // Come back visible — OPEN socket → verify
     fireVisibilityChange('visible')
+    const ws = FakeWebSocket.instances[0]!
+    expect(ws.sent).toHaveLength(1) // verify ping
 
-    // Old socket should be torn down
-    expect(FakeWebSocket.instances[0]!.onopen).toBeNull()
+    // No pong → verify timeout → forceReconnect
+    fireVerifyTimer()
+    expect(ws.onopen).toBeNull()
 
-    // Fire settle timer
     fireSettleTimer()
-
-    // Should have force reconnected (new socket created)
     expect(FakeWebSocket.instances).toHaveLength(2)
   })
 })
@@ -1093,6 +1114,10 @@ describe('resume settle delay', () => {
     manager.connect()
     FakeWebSocket.instances[0]!.triggerOpen()
     manager.startLifecycleListeners()
+
+    // Close socket so resume goes to forceReconnect path (not verify)
+    ;(manager as unknown as { ws: null }).ws = null
+    ;(manager as unknown as { status: string }).status = 'reconnecting'
 
     fireVisibilityChange('visible')
 
@@ -1119,6 +1144,10 @@ describe('resume settle delay', () => {
     FakeWebSocket.instances[0]!.triggerOpen()
     manager.startLifecycleListeners()
 
+    // Close socket so resume goes to forceReconnect path
+    ;(manager as unknown as { ws: null }).ws = null
+    ;(manager as unknown as { status: string }).status = 'reconnecting'
+
     fireVisibilityChange('visible')
 
     // Fire settle timer to trigger connect
@@ -1129,7 +1158,6 @@ describe('resume settle delay', () => {
     expect(connectTimeout).toBeDefined()
 
     // Standard 3000ms timeout should NOT be present for the new socket
-    // (the old one was cleared during destroySocket)
     const standardTimeouts = timers.filter((t) => t.delay === 3000)
     expect(standardTimeouts).toHaveLength(0)
   })
@@ -1321,5 +1349,240 @@ describe('stall detection', () => {
 
     // Successful open resets failures
     expect(getFailures()).toBe(0)
+  })
+})
+
+describe('verification ping on resume', () => {
+  test('verify sends ping with current seq on OPEN socket', () => {
+    const manager = new WebSocketManager()
+    manager.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.triggerOpen()
+    manager.startLifecycleListeners()
+
+    fireVisibilityChange('visible')
+
+    expect(ws.sent).toHaveLength(1)
+    const ping = JSON.parse(ws.sent[0]!)
+    expect(ping.type).toBe('ping')
+    expect(ping.seq).toBe(1)
+
+    // Verify timeout timer scheduled (1500ms)
+    const verifyTimeout = timers.find((t) => t.delay === 1500)
+    expect(verifyTimeout).toBeDefined()
+  })
+
+  test('pong with matching seq confirms socket and starts early heartbeat', () => {
+    const manager = new WebSocketManager()
+    manager.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.triggerOpen()
+    manager.startLifecycleListeners()
+
+    // Go hidden to stop heartbeat (simulates real background/foreground cycle)
+    fireVisibilityChange('hidden')
+    // Come back visible — verify
+    fireVisibilityChange('visible')
+    expect(ws.sent).toHaveLength(1) // verify ping
+
+    // Matching pong confirms socket
+    respondWithPong(ws)
+
+    // Verify timer should be cleared
+    expect(timers.some((t) => t.delay === 1500)).toBe(false)
+
+    // Early heartbeat timer (5000ms) should be scheduled
+    const earlyHeartbeat = timers.find((t) => t.delay === 5000)
+    expect(earlyHeartbeat).toBeDefined()
+
+    // Socket kept alive — no new sockets
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(ws.onopen).not.toBeNull()
+  })
+
+  test('verify send failure triggers immediate forceReconnect', () => {
+    const manager = new WebSocketManager()
+    manager.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.triggerOpen()
+    manager.startLifecycleListeners()
+
+    ws.throwOnSend = true
+
+    fireVisibilityChange('visible')
+
+    // send() fails → forceReconnect immediately (no verify timer)
+    expect(timers.some((t) => t.delay === 1500)).toBe(false)
+
+    // Socket destroyed
+    expect(ws.onopen).toBeNull()
+
+    // Settle timer scheduled
+    fireSettleTimer()
+    expect(FakeWebSocket.instances).toHaveLength(2)
+  })
+
+  test('hidden during verification cancels verify timer', () => {
+    const manager = new WebSocketManager()
+    manager.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.triggerOpen()
+    manager.startLifecycleListeners()
+
+    // Start verify
+    fireVisibilityChange('visible')
+    expect(timers.some((t) => t.delay === 1500)).toBe(true)
+
+    // Go hidden before pong arrives — verify should be cancelled
+    fireVisibilityChange('hidden')
+    expect(timers.some((t) => t.delay === 1500)).toBe(false)
+
+    // Socket still intact (not destroyed)
+    expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+
+  test('second verify supersedes first (idempotent)', () => {
+    const manager = new WebSocketManager()
+    manager.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.triggerOpen()
+    manager.startLifecycleListeners()
+
+    // First verify
+    fireVisibilityChange('visible')
+    const firstVerify = timers.find((t) => t.delay === 1500)
+    expect(firstVerify).toBeDefined()
+
+    // Second verify — should cancel first and create new
+    fireVisibilityChange('visible')
+
+    // Only one verify timer active
+    const verifyTimers = timers.filter((t) => t.delay === 1500)
+    expect(verifyTimers).toHaveLength(1)
+    expect(verifyTimers[0]!.id).not.toBe(firstVerify!.id)
+
+    // Two pings sent (one per verify)
+    expect(ws.sent).toHaveLength(2)
+    const ping1 = JSON.parse(ws.sent[0]!)
+    const ping2 = JSON.parse(ws.sent[1]!)
+    expect(ping2.seq).toBe(ping1.seq + 1)
+  })
+
+  test('early heartbeat fires at 5s then switches to normal 20s interval', () => {
+    const manager = new WebSocketManager()
+    manager.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.triggerOpen()
+    manager.startLifecycleListeners()
+
+    fireVisibilityChange('hidden')
+    fireVisibilityChange('visible')
+
+    // Verify succeeds
+    respondWithPong(ws)
+
+    // Early heartbeat (5000ms) scheduled as setTimeout
+    const earlyTimer = timers.find((t) => t.delay === 5000)
+    expect(earlyTimer).toBeDefined()
+
+    // No heartbeat interval yet (waiting for early timer to fire)
+    expect(intervals.some((i) => i.interval === 20000)).toBe(false)
+
+    // Fire early timer — should send ping and switch to normal interval
+    earlyTimer!.callback()
+    expect(ws.sent).toHaveLength(2) // verify ping + heartbeat ping
+
+    // Now a 20000ms heartbeat interval should exist
+    expect(intervals.some((i) => i.interval === 20000)).toBe(true)
+  })
+
+  test('non-OPEN socket on resume goes to forceReconnect (not verify)', () => {
+    const manager = new WebSocketManager()
+    manager.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.triggerOpen()
+    manager.startLifecycleListeners()
+
+    // Socket died
+    ;(manager as unknown as { ws: null }).ws = null
+    ;(manager as unknown as { status: string }).status = 'reconnecting'
+
+    fireVisibilityChange('visible')
+
+    // No verify timer — went straight to forceReconnect
+    expect(timers.some((t) => t.delay === 1500)).toBe(false)
+    // Settle timer scheduled
+    expect(timers.some((t) => t.delay === 750)).toBe(true)
+  })
+})
+
+describe('stale socket guards', () => {
+  test('stale onopen from replaced socket is ignored', () => {
+    const manager = new WebSocketManager()
+    const statuses: string[] = []
+    manager.subscribeStatus((status) => statuses.push(status))
+
+    manager.connect()
+    const ws1 = FakeWebSocket.instances[0]!
+
+    // Replace socket before ws1 opens
+    ;(manager as unknown as { ws: null }).ws = null
+    manager.connect()
+    const ws2 = FakeWebSocket.instances[1]!
+
+    // Late onopen from ws1 — should be ignored
+    ws1.readyState = FakeWebSocket.OPEN
+    ws1.onopen?.()
+
+    // Status should still be connecting (ws2 hasn't opened)
+    expect(statuses[statuses.length - 1]).toBe('connecting')
+
+    // ws2 opens — this should be accepted
+    ws2.triggerOpen()
+    expect(statuses[statuses.length - 1]).toBe('connected')
+  })
+
+  test('stale onclose from replaced socket is ignored', () => {
+    const manager = new WebSocketManager()
+    const statuses: string[] = []
+    manager.subscribeStatus((status) => statuses.push(status))
+
+    manager.connect()
+    const ws1 = FakeWebSocket.instances[0]!
+    ws1.triggerOpen()
+
+    // Replace socket
+    ;(manager as unknown as { ws: null }).ws = null
+    manager.connect()
+    const ws2 = FakeWebSocket.instances[1]!
+    ws2.triggerOpen()
+
+    // Late onclose from ws1 — should be ignored
+    ws1.onclose?.({ code: 1006, reason: '', wasClean: false } as CloseEvent)
+
+    // Status should still be connected (ws2 is healthy)
+    expect(statuses[statuses.length - 1]).toBe('connected')
+    // No reconnect timer scheduled
+    expect(timers.some((t) => t.delay >= 1000 && t.delay <= 30000)).toBe(false)
+  })
+})
+
+describe('destroySocket re-tracks as leaked', () => {
+  test('healthy socket re-added to leakedSockets when destroyed', () => {
+    const manager = new WebSocketManager()
+    const leaked = () => (manager as unknown as { leakedSockets: Set<unknown> }).leakedSockets
+
+    manager.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.triggerOpen()
+
+    // After open, socket is NOT in leakedSockets
+    expect(leaked().has(ws)).toBe(false)
+
+    // Destroy the socket (e.g., via verify timeout → forceReconnect)
+    manager.disconnect()
+
+    // Socket should be re-added to leakedSockets for potential purging
+    expect(leaked().has(ws)).toBe(true)
   })
 })

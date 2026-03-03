@@ -1,10 +1,27 @@
 /**
  * useWebSocket.ts — WebSocket connection manager with iOS Safari PWA support.
  *
- * Handles reconnection after background/foreground transitions via:
- * - visibilitychange listener with suspension detection (force reconnect when
- *   time gap > 10s indicates OS froze the process — fixes iOS zombie sockets)
- * - pageshow listener (bfcache restore — always forces reconnect)
+ * Resume strategy (visibilitychange → visible):
+ *
+ *   Industry consensus (Socket.IO, graphql-ws, tRPC, ActionCable) is to
+ *   force-reconnect on every resume.  We intentionally deviate from this
+ *   because on iOS Safari PWA, destroying a healthy socket and creating a
+ *   new WebSocket during the visibility transition frequently fails — the
+ *   new connection hangs or is rejected, causing an unrecoverable reconnect
+ *   loop.  Force-closing the app clears all TCP connections at the OS level
+ *   and "fixes" it, but that's not a real solution.
+ *
+ *   Instead, we verify the existing socket with a quick ping before
+ *   destroying it.  For the common case (short background, healthy socket),
+ *   the pong arrives in <100 ms and we avoid creating any new connections.
+ *   For zombie sockets (iOS reports readyState OPEN but the socket is dead),
+ *   the verify times out after 1.5 s and we fall back to force-reconnect.
+ *   Because force-reconnect only runs when truly needed (not every resume),
+ *   zombie TCP connections don't accumulate and the reconnect is more likely
+ *   to succeed.
+ *
+ * Other reconnection triggers:
+ * - pageshow (bfcache restore — always forces reconnect)
  * - Time-jump detector (fallback for deep PWA suspension — always forces)
  * - Connection timeout (prevents zombie sockets from blocking reconnect)
  * - Application-level ping/pong heartbeat (detects dead sockets in foreground)
@@ -47,18 +64,26 @@ const WAKE_JUMP_MS = 15_000
 /** Tick interval for the time-jump detector. */
 const WAKE_CHECK_INTERVAL_MS = 5_000
 
-// SUSPEND_THRESHOLD_MS (10_000) — removed: we now always force-reconnect
-// on resume regardless of gap duration.  The short-vs-long distinction
-// was unreliable and the verification ping wasted 3 s on zombie sockets.
-
 /** How often to send an application-level ping to detect dead sockets. */
 const HEARTBEAT_INTERVAL_MS = 20_000
 
 /** How long to wait for a pong before declaring the socket dead. */
 const PONG_TIMEOUT_MS = 10_000
 
-// RESUME_PONG_TIMEOUT_MS (3_000) — removed: short resumes now always
-// force-reconnect instead of sending a verification ping on the zombie.
+/**
+ * How long to wait for a verification pong on resume before concluding the
+ * socket is a zombie and falling back to force-reconnect.  1.5 s is enough
+ * for a round-trip on any reasonable network while being short enough that
+ * zombie detection feels responsive.
+ */
+const VERIFY_PONG_TIMEOUT_MS = 1_500
+
+/**
+ * After a successful verification, send the first heartbeat ping sooner than
+ * the normal 20 s interval to quickly catch sockets that pass verification
+ * but die shortly after (e.g. flaky post-resume network).
+ */
+const EARLY_HEARTBEAT_MS = 5_000
 
 /**
  * Delay before the first reconnect attempt after a resume event.
@@ -103,6 +128,8 @@ export class WebSocketManager {
    * Prevents hitting the browser's per-origin connection limit.
    */
   private leakedSockets = new Set<WebSocket>()
+  /** Pending verification timer — non-null while awaiting a verify pong. */
+  private verifyTimer: number | null = null
 
   private wsSnap() {
     return {
@@ -112,6 +139,8 @@ export class WebSocketManager {
       failures: this.consecutiveFailures,
       leaked: this.leakedSockets.size,
       online: typeof navigator !== 'undefined' ? navigator.onLine : undefined,
+      verifying: this.verifyTimer !== null,
+      buffered: this.ws ? this.ws.bufferedAmount : undefined,
     }
   }
 
@@ -137,7 +166,7 @@ export class WebSocketManager {
 
     const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'
     const wsUrl = `${scheme}://${window.location.host}/ws`
-    clientLog('ws_connect', { url: wsUrl, resume: this.isResumeAttempt, ...this.wsSnap() })
+    clientLog('ws_connect', { url: wsUrl, resume: this.isResumeAttempt, ...this.wsSnap() }, 'info')
 
     const ws = new WebSocket(wsUrl)
     this.ws = ws
@@ -161,7 +190,7 @@ export class WebSocketManager {
           managerStatus: this.status,
           timeoutMs: timeout,
           ...this.wsSnap(),
-        })
+        }, 'info')
         this.consecutiveFailures += 1
         this.destroySocket()
         this.scheduleReconnect()
@@ -169,7 +198,14 @@ export class WebSocketManager {
     }, timeout)
 
     ws.onopen = () => {
-      clientLog('ws_onopen', this.wsSnap())
+      // Guard: ignore late events from a socket that was already replaced.
+      // iOS Safari can queue events during resume and dispatch them after
+      // a new socket has been created.
+      if (this.ws !== ws) {
+        clientLog('ws_onopen_stale', this.wsSnap(), 'info')
+        return
+      }
+      clientLog('ws_onopen', this.wsSnap(), 'info')
       this.clearConnectTimer()
       this.reconnectAttempts = 0
       this.consecutiveFailures = 0
@@ -187,6 +223,14 @@ export class WebSocketManager {
         if (parsed.type === 'pong') {
           if (parsed.seq === this.pingSeq) {
             this.clearPongTimer()
+            // If we were waiting for a verification pong, the socket is
+            // confirmed alive — cancel the verify timeout and resume normal
+            // operation with an early heartbeat to catch post-resume flakiness.
+            if (this.verifyTimer !== null) {
+              this.cancelVerify()
+              clientLog('ws_verify_ok', this.wsSnap(), 'info')
+              this.startHeartbeat(EARLY_HEARTBEAT_MS)
+            }
           }
           return
         }
@@ -197,15 +241,22 @@ export class WebSocketManager {
     }
 
     ws.onerror = () => {
-      clientLog('ws_onerror', this.wsSnap())
+      if (this.ws !== ws) return
+      clientLog('ws_onerror', this.wsSnap(), 'info')
       // Don't reconnect here — per the WHATWG spec, onclose always fires
       // after onerror. Let onclose handle reconnection to avoid double-fire.
       this.clearConnectTimer()
     }
 
     ws.onclose = (e) => {
-      clientLog('ws_onclose', { code: e.code, reason: e.reason, clean: e.wasClean, ...this.wsSnap() })
+      // Guard: ignore close events from a socket that was already replaced.
+      if (this.ws !== ws) {
+        clientLog('ws_onclose_stale', { code: e.code, ...this.wsSnap() }, 'info')
+        return
+      }
+      clientLog('ws_onclose', { code: e.code, reason: e.reason, clean: e.wasClean, ...this.wsSnap() }, 'info')
       this.clearConnectTimer()
+      this.cancelVerify()
       this.consecutiveFailures += 1
       this.ws = null
       if (!this.manualClose) {
@@ -219,6 +270,7 @@ export class WebSocketManager {
   disconnect() {
     this.manualClose = true
     this.clearConnectTimer()
+    this.cancelVerify()
     if (this.reconnectTimer) {
       window.clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
@@ -254,7 +306,7 @@ export class WebSocketManager {
         return
       }
       if (gap > WAKE_JUMP_MS) {
-        clientLog('ws_time_jump', { gapMs: gap, ...this.wsSnap() })
+        clientLog('ws_time_jump', { gapMs: gap, ...this.wsSnap() }, 'info')
         this.forceReconnect('time_jump', true)
       }
       this.lastTick = now
@@ -284,7 +336,7 @@ export class WebSocketManager {
         messageType: message.type,
         error: error instanceof Error ? error.message : String(error),
         ...this.wsSnap(),
-      })
+      }, 'info')
       this.destroySocket()
       this.scheduleReconnect()
       return false
@@ -313,7 +365,7 @@ export class WebSocketManager {
   // ── Private ──────────────────────────────────────────────
 
   private onVisibilityChange = () => {
-    clientLog('ws_visibility', { state: document.visibilityState, ...this.wsSnap() })
+    clientLog('ws_visibility', { state: document.visibilityState, ...this.wsSnap() }, 'info')
     if (document.visibilityState === 'visible') {
       const now = Date.now()
       const gap = now - this.lastTick
@@ -321,17 +373,24 @@ export class WebSocketManager {
       // from seeing a stale gap and firing a second forceReconnect.
       this.lastTick = now
 
-      // Always force-reconnect on resume with force=true.  Even short
-      // backgrounds (<10 s) can leave zombie sockets on iOS Safari — the
-      // verification-ping approach wasted 3 s on a zombie that can never
-      // respond.  Instead, tear down immediately and reconnect with a short
-      // settle delay so iOS has time to bring the network back.
-      clientLog('ws_resume', { gapMs: gap })
-      this.forceReconnect('visibilitychange', true)
+      clientLog('ws_resume', { gapMs: gap, ...this.wsSnap() }, 'info')
+
+      // If the socket still reports OPEN, verify it with a quick ping before
+      // tearing it down.  On short backgrounds the socket is almost always
+      // healthy — destroying it and creating a new WebSocket during the iOS
+      // resume transition is what causes the unrecoverable reconnect loop.
+      // See file-level comment for the full rationale.
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.verifyConnection()
+      } else {
+        // Socket already closed/closing/connecting — go straight to reconnect
+        this.forceReconnect('visibilitychange', true)
+      }
     } else {
       // Pause heartbeat when hidden — iOS freezes timers anyway,
       // and pong timeout would false-positive on wake.
       this.stopHeartbeat()
+      this.cancelVerify()
       // Cancel pending reconnect — it would fire in the background
       // otherwise (timer was set before the tab was hidden).
       // forceReconnect() handles reconnection when visible again.
@@ -343,11 +402,56 @@ export class WebSocketManager {
   }
 
   private onPageShow = (e: PageTransitionEvent) => {
-    clientLog('ws_pageshow', { persisted: e.persisted, ...this.wsSnap() })
+    clientLog('ws_pageshow', { persisted: e.persisted, ...this.wsSnap() }, 'info')
     if (e.persisted) {
       // Reset lastTick to prevent wake-check double reconnect after bfcache restore
       this.lastTick = Date.now()
       this.forceReconnect('pageshow', true)
+    }
+  }
+
+  /**
+   * Send a verification ping on the existing socket to check if it's still
+   * alive after a background/foreground transition.  If the server responds
+   * with a matching pong within VERIFY_PONG_TIMEOUT_MS, the socket is
+   * confirmed healthy and we restart the heartbeat.  If no pong arrives in
+   * time, the socket is a zombie — fall back to forceReconnect.
+   *
+   * On zombie sockets, send() succeeds silently (data is buffered but never
+   * delivered, per WHATWG spec).  The timeout is the real detection mechanism.
+   */
+  private verifyConnection() {
+    this.cancelVerify()
+    // Stop heartbeat so an in-flight pong timeout can't race with verify.
+    // Both use pingSeq — advancing it here would orphan any pending heartbeat
+    // pong, causing pongTimer to fire and kill a healthy socket.
+    this.stopHeartbeat()
+    this.pingSeq += 1
+    const seq = this.pingSeq
+    const ws = this.ws
+    clientLog('ws_verify', { seq, ...this.wsSnap() }, 'info')
+
+    // send() checks readyState and wraps in try/catch.  If it fails, the
+    // socket is clearly dead — go straight to force-reconnect.
+    if (!this.send({ type: 'ping', seq })) {
+      clientLog('ws_verify_send_fail', this.wsSnap(), 'info')
+      this.forceReconnect('verify_send_fail', true)
+      return
+    }
+
+    this.verifyTimer = window.setTimeout(() => {
+      this.verifyTimer = null
+      // Guard: ignore stale timeout from a socket that was already replaced.
+      if (this.ws !== ws) return
+      clientLog('ws_verify_timeout', this.wsSnap(), 'info')
+      this.forceReconnect('verify_timeout', true)
+    }, VERIFY_PONG_TIMEOUT_MS)
+  }
+
+  private cancelVerify() {
+    if (this.verifyTimer !== null) {
+      window.clearTimeout(this.verifyTimer)
+      this.verifyTimer = null
     }
   }
 
@@ -391,7 +495,7 @@ export class WebSocketManager {
     }
 
     this.lastForceReconnectTs = now
-    clientLog('ws_force_reconnect', { trigger, force, ...this.wsSnap() })
+    clientLog('ws_force_reconnect', { trigger, force, ...this.wsSnap() }, 'info')
     this.reconnectAttempts = 0
     this.consecutiveFailures = 0
     if (this.reconnectTimer) {
@@ -427,10 +531,15 @@ export class WebSocketManager {
    * TCP/Tailscale tunnel warm. These application-level pings let the client
    * proactively detect zombie sockets that protocol pings can't surface
    * (browsers don't expose protocol-level pong events to JS).
+   *
+   * @param firstDelayMs — if provided, fire the first ping after this delay
+   *   instead of waiting the full HEARTBEAT_INTERVAL_MS.  Used after
+   *   verification to quickly catch flaky post-resume sockets.
    */
-  private startHeartbeat() {
+  private startHeartbeat(firstDelayMs?: number) {
     this.stopHeartbeat()
-    this.heartbeatTimer = window.setInterval(() => {
+
+    const sendPing = () => {
       if (this.ws?.readyState !== WebSocket.OPEN) return
       this.pingSeq += 1
       if (!this.send({ type: 'ping', seq: this.pingSeq })) return
@@ -438,16 +547,29 @@ export class WebSocketManager {
       this.clearPongTimer()
       this.pongTimer = window.setTimeout(() => {
         this.pongTimer = null
-        clientLog('ws_pong_timeout', this.wsSnap())
+        clientLog('ws_pong_timeout', this.wsSnap(), 'info')
         this.destroySocket()
         this.scheduleReconnect()
       }, PONG_TIMEOUT_MS)
-    }, HEARTBEAT_INTERVAL_MS)
+    }
+
+    if (firstDelayMs !== undefined && firstDelayMs < HEARTBEAT_INTERVAL_MS) {
+      // Fire one early ping, then switch to the normal interval.
+      this.heartbeatTimer = window.setTimeout(() => {
+        sendPing()
+        this.heartbeatTimer = window.setInterval(sendPing, HEARTBEAT_INTERVAL_MS)
+      }, firstDelayMs)
+    } else {
+      this.heartbeatTimer = window.setInterval(sendPing, HEARTBEAT_INTERVAL_MS)
+    }
   }
 
   private stopHeartbeat() {
     if (this.heartbeatTimer !== null) {
-      window.clearInterval(this.heartbeatTimer)
+      // Could be either setTimeout (early ping) or setInterval — both
+      // use the same ID space and clearTimeout/clearInterval are
+      // interchangeable per the HTML spec.
+      window.clearTimeout(this.heartbeatTimer)
       this.heartbeatTimer = null
     }
     this.clearPongTimer()
@@ -481,7 +603,7 @@ export class WebSocketManager {
     // exhausting per-origin connection slots, which would explain why
     // force-closing the app (killing all TCP connections) fixes it instantly.
     if (this.consecutiveFailures >= STALL_THRESHOLD) {
-      clientLog('ws_stall_detected', this.wsSnap())
+      clientLog('ws_stall_detected', this.wsSnap(), 'info')
       this.purgeLeakedSockets()
       // Give the browser extra time to clean up TCP connections
       this.consecutiveFailures = 0
@@ -524,9 +646,14 @@ export class WebSocketManager {
   private destroySocket() {
     this.clearConnectTimer()
     this.stopHeartbeat()
+    this.cancelVerify()
     if (!this.ws) return
     const ws = this.ws
     this.ws = null
+    // Re-track as potentially leaked — even healthy sockets can become TCP
+    // zombies when destroyed after resume on iOS Safari.  This ensures
+    // purgeLeakedSockets() can attempt to close them.
+    this.leakedSockets.add(ws)
     ws.onopen = null
     ws.onmessage = null
     ws.onerror = null
@@ -551,7 +678,7 @@ export class WebSocketManager {
    */
   private purgeLeakedSockets() {
     if (this.leakedSockets.size === 0) return
-    clientLog('ws_purge_leaked', { count: this.leakedSockets.size })
+    clientLog('ws_purge_leaked', { count: this.leakedSockets.size }, 'info')
     for (const leaked of this.leakedSockets) {
       try {
         // Null out handlers to prevent any late-firing events
