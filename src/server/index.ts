@@ -1,4 +1,5 @@
 import type { ServerWebSocket } from 'bun'
+import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 import { Hono } from 'hono'
@@ -784,6 +785,28 @@ logger.info('startup_state', {
 refreshSessionsSync() // hydrate from persisted associations without verification
 setInterval(refreshSessions, config.refreshIntervalMs) // Async for periodic
 
+// Event loop lag monitor — detects when spawnSync or other blocking work
+// starves the event loop, causing typing lag and slow WebSocket delivery.
+if (logLevel === 'debug') {
+  const EL_CHECK_MS = 500
+  let elLastTick = performance.now()
+  setInterval(() => {
+    const now = performance.now()
+    const lagMs = Math.round(now - elLastTick - EL_CHECK_MS)
+    elLastTick = now
+    if (lagMs > 100) {
+      const [load1, load5, load15] = os.loadavg()
+      logger.debug('event_loop_lag', {
+        lagMs,
+        load1: Math.round(load1 * 100) / 100,
+        load5: Math.round(load5 * 100) / 100,
+        load15: Math.round(load15 * 100) / 100,
+        cpus: os.cpus().length,
+      })
+    }
+  }, EL_CHECK_MS)
+}
+
 async function completeStartupVerification(): Promise<void> {
   const activeSessions = db.getActiveSessions()
   // Use local-only sessions for verification to prevent remote sessions
@@ -1181,6 +1204,7 @@ Bun.serve<WSData>({
   websocket: {
     idleTimeout: 40,
     sendPings: true,
+    perMessageDeflate: true,
     open(ws) {
       sockets.add(ws)
       send(ws, { type: 'sessions', sessions: registry.getAll() })
@@ -2253,7 +2277,18 @@ async function attachTerminalPersistent(
       ws.data.currentTmuxTarget = effectiveTarget
       // Send history in onReady callback, before output suppression is lifted
       if (history) {
-        send(ws, { type: 'terminal-output', sessionId, data: history })
+        const tStr = performance.now()
+        const payload = JSON.stringify({ type: 'terminal-output', sessionId, data: history })
+        const stringifyMs = Math.round(performance.now() - tStr)
+        const sendResult = ws.send(payload)
+        logger.debug('terminal_history_send', {
+          sessionId,
+          stringifyMs,
+          payloadBytes: payload.length,
+          historyChars: history.length,
+          sendResult,
+          connectionId: ws.data.connectionId,
+        })
       }
     })
     const tSwitch = performance.now()
