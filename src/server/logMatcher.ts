@@ -1050,12 +1050,43 @@ function extractUserFromPrompt(line: string): string {
   return cleaned
 }
 
+/**
+ * Detect a box-drawing horizontal separator line (e.g. ─────────).
+ * Claude Code draws these as the input field border using U+2500 (─),
+ * sometimes mixed with U+2501 (━) or U+2550 (═). A line of 20+ such
+ * characters is a reliable signal that we're inside the input box.
+ */
+const BOX_SEPARATOR_PATTERN = /^[─━═]{20,}$/
+
+/**
+ * Max distance from the bottom of the scrollback for the box separator
+ * check. The input field is always at the very bottom of the terminal,
+ * so we only trust the separator when the prompt is within this many
+ * lines of the end — avoids false positives from ─── in pasted content
+ * or markdown tables higher up in the scrollback.
+ */
+const BOX_SEPARATOR_BOTTOM_MARGIN = 8
+
 function isCurrentInputField(rawLines: string[], promptIdx: number): boolean {
+  const nearBottom = rawLines.length - promptIdx <= BOX_SEPARATOR_BOTTOM_MARGIN
   for (let i = promptIdx + 1; i < Math.min(promptIdx + 4, rawLines.length); i++) {
     const line = rawLines[i]?.trim() ?? ''
     if (/\d+%\s*(?:context\s*)?left/i.test(line)) return true
     if (/\[\d+%\]/.test(line)) return true
     if (/\?\s*for\s*shortcuts/i.test(line)) return true
+    // Claude Code input box border — only trust near the bottom of scrollback
+    // and only if no assistant output (⏺) appears between the prompt and the
+    // separator, which would mean the prompt was already submitted.
+    if (nearBottom && BOX_SEPARATOR_PATTERN.test(line)) {
+      let hasAssistantOutput = false
+      for (let j = promptIdx + 1; j < i; j++) {
+        if (/⏺/.test(rawLines[j] ?? '')) {
+          hasAssistantOutput = true
+          break
+        }
+      }
+      if (!hasAssistantOutput) return true
+    }
   }
   return false
 }

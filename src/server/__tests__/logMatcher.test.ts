@@ -849,6 +849,76 @@ Enter to select · Esc to cancel`
       'is there any benefit for Effect on client side'
     )
   })
+
+  test('Claude: skips idle input above box-drawing separator', () => {
+    // Claude Code draws ─────── as the input field border. Any prompt
+    // at the bottom of the scrollback above this separator is the idle
+    // input field, not a submitted user message.
+    const scrollback = `❯ yea do it
+
+⏺ Pushed. Two commits landed:
+
+❯
+───────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).toContain('yea do it')
+    // The empty idle prompt should not produce a message
+    expect(userMessages).toHaveLength(1)
+  })
+
+  test('Claude: skips any text in idle input above box separator', () => {
+    // Claude Code may display arbitrary hints (e.g. "Press up to edit
+    // queued messages") in the input field. The box separator below
+    // detects it structurally — no need to match specific hint text.
+    const scrollback = `❯ implement the plan
+
+⏺ Done. All tests pass.
+
+❯ Press up to edit queued messages
+───────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).not.toContain('Press up to edit queued messages')
+    expect(userMessages).toContain('implement the plan')
+  })
+
+  test('does not false-positive on ─── in chat history higher up', () => {
+    // A user might paste markdown tables or separators that contain ───.
+    // These should NOT cause the prompt above them to be filtered out.
+    const scrollback = `❯ here is my markdown table
+
+⏺ Got it, here's the formatted version:
+───────────────────────────────────────────────
+| col1 | col2 |
+───────────────────────────────────────────────
+
+❯ looks good, ship it
+
+⏺ Done.
+
+❯
+  claude-opus-4-6 · 42% context left · ~/project`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    // Both real user messages should be preserved
+    expect(userMessages).toContain('here is my markdown table')
+    expect(userMessages).toContain('looks good, ship it')
+  })
+
+  test('does not false-positive when submitted prompt + short response + separator near bottom', () => {
+    // A submitted message near the bottom with ─── below should NOT be
+    // treated as the idle input field when assistant output (⏺) intervenes.
+    const scrollback = `❯ summarize this
+
+⏺ Done.
+───────────────────────────────────────────────`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).toContain('summarize this')
+  })
 })
 
 describe('extractActionFromUserAction', () => {
