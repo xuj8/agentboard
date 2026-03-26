@@ -9,6 +9,7 @@ import { ToastViewport, toastManager } from './components/Toast'
 import { useSessionStore } from './stores/sessionStore'
 import {
   useSettingsStore,
+  useSettingsHasHydrated,
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
 } from './stores/settingsStore'
@@ -62,6 +63,7 @@ export default function App() {
   const hostLabel = useSessionStore((state) => state.hostLabel)
 
   const theme = useThemeStore((state) => state.theme)
+  const settingsHydrated = useSettingsHasHydrated()
   const defaultProjectDir = useSettingsStore(
     (state) => state.defaultProjectDir
   )
@@ -430,7 +432,7 @@ export default function App() {
       // New session: [mod]+N
       if (isShortcut && code === 'KeyN') {
         event.preventDefault()
-        if (!isModalOpen) {
+        if (!isModalOpen && settingsHydrated) {
           setIsModalOpen(true)
         }
         return
@@ -448,13 +450,15 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [isModalOpen, selectedSessionId, setSelectedSessionId, filteredSortedSessions, handleKillSession, shortcutModifier])
+  }, [isModalOpen, selectedSessionId, setSelectedSessionId, filteredSortedSessions, handleKillSession, shortcutModifier, settingsHydrated])
 
-  const handleNewSession = () => {
+  const handleNewSession = (): boolean => {
+    if (!settingsHydrated) return false
     setNewSessionInitialHost(undefined)
     setNewSessionInitialPath(undefined)
     setNewSessionInitialCommand(undefined)
     setIsModalOpen(true)
+    return true
   }
   const handleOpenSettings = () => setIsSettingsOpen(true)
 

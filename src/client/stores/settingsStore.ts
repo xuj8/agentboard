@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import { safeStorage } from '../utils/storage'
@@ -375,4 +376,23 @@ export {
   SIDEBAR_MIN_WIDTH,
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_DEFAULT_WIDTH,
+}
+
+/**
+ * Returns true once the settings store has finished hydrating from
+ * localStorage. Prevents components from reading default (pre-hydration)
+ * values like DEFAULT_PRESETS instead of the user's saved settings.
+ */
+export function useSettingsHasHydrated(): boolean {
+  const [hydrated, setHydrated] = useState(useSettingsStore.persist.hasHydrated())
+
+  useEffect(() => {
+    const unsub = useSettingsStore.persist.onFinishHydration(() => setHydrated(true))
+    // Re-check after subscribing to close the race window where hydration
+    // completes between the initial useState and the effect subscription.
+    if (useSettingsStore.persist.hasHydrated()) setHydrated(true)
+    return unsub
+  }, [])
+
+  return hydrated
 }

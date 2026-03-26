@@ -19,7 +19,7 @@ interface SessionDrawerProps {
   onRename: (sessionId: string, newName: string) => void
   onResume?: (sessionId: string) => void
   onSetPinned?: (sessionId: string, isPinned: boolean) => void
-  onNewSession: () => void
+  onNewSession: () => boolean | void
   loading: boolean
   error: string | null
 }
@@ -161,8 +161,7 @@ export default function SessionDrawer({
         >
           <button
             onClick={() => {
-              onNewSession()
-              onClose()
+              if (onNewSession() !== false) onClose()
             }}
             className="btn btn-primary w-full py-2 text-sm"
           >

@@ -297,7 +297,7 @@ describe('SessionDrawer', () => {
           selectedSessionId={null}
           onSelect={(sessionId) => selectCalls.push(sessionId)}
           onRename={() => {}}
-          onNewSession={() => newSessionCalls.push(1)}
+          onNewSession={() => { newSessionCalls.push(1); return true }}
           loading={false}
           error={null}
         />,
