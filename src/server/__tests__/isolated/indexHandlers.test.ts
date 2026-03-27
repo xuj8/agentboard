@@ -99,6 +99,7 @@ function makeRecord(overrides: Partial<AgentSessionRecord> = {}): AgentSessionRe
     lastResumeError: null,
     lastKnownLogSize: null,
     isCodexExec: false,
+    launchCommand: null,
     ...overrides,
   }
 }
@@ -360,6 +361,36 @@ mock.module('../../db', () => ({
     close: () => {},
   }),
 }))
+// Controllable refresh worker mock.
+// By default, refresh() resolves immediately with refreshWorkerSessions.
+// Set refreshWorkerDeferred = true before triggering a refresh to make it
+// hang until refreshWorkerResolve/Reject is called.
+let refreshWorkerDeferred = false
+let refreshWorkerSessions: Session[] = []
+let refreshWorkerResolve: ((sessions: Session[]) => void) | null = null
+let _refreshWorkerReject: ((error: Error) => void) | null = null
+
+class SessionRefreshWorkerClientMock {
+  refresh(_managedSession: string, _discoverPrefixes: string[]): Promise<Session[]> {
+    if (refreshWorkerDeferred) {
+      return new Promise<Session[]>((resolve, reject) => {
+        refreshWorkerResolve = resolve
+        _refreshWorkerReject = reject
+      })
+    }
+    return Promise.resolve(refreshWorkerSessions)
+  }
+
+  getLastUserMessage(): Promise<string | null> {
+    return Promise.resolve(null)
+  }
+
+  dispose(): void {}
+}
+
+mock.module('../../sessionRefreshWorkerClient', () => ({
+  SessionRefreshWorkerClient: SessionRefreshWorkerClientMock,
+}))
 mock.module('../../SessionManager', () => ({
   SessionManager: SessionManagerMock,
 }))
@@ -455,6 +486,10 @@ beforeEach(() => {
   replaceSessionsCalls = []
   TerminalProxyMock.instances = []
   SessionManagerMock.instance = null
+  refreshWorkerDeferred = false
+  refreshWorkerSessions = []
+  refreshWorkerResolve = null
+  _refreshWorkerReject = null
   SessionRegistryMock.instance = null
   resetDbState()
   Object.assign(configState, defaultConfig)
@@ -760,6 +795,54 @@ describe('server message handlers', () => {
 
     expect(sent[sent.length - 2]).toEqual({ type: 'kill-failed', sessionId: baseSession.id, message: 'boom' })
     expect(sent[sent.length - 1]).toEqual({ type: 'error', message: 'nope' })
+  })
+
+  test('stale in-flight refresh does not resurrect killed session', async () => {
+    const otherSession: Session = { ...baseSession, id: 'other', name: 'other', tmuxWindow: 'agentboard:2' }
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [baseSession]
+    sessionManagerState.killWindow = () => {}
+    // After kill, only otherSession should remain
+    sessionManagerState.listWindows = () => [otherSession]
+
+    const { ws } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    // 1. Start an async refresh BEFORE the kill — simulates the 2s periodic refresh
+    refreshWorkerDeferred = true
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-refresh' })
+    )
+    const staleResolve = refreshWorkerResolve
+    expect(staleResolve).not.toBeNull()
+
+    // 2. Kill the session while the refresh is in flight
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-kill', sessionId: baseSession.id })
+    )
+
+    // After kill, registry should not contain the killed session
+    const afterKill = replaceSessionsCalls[replaceSessionsCalls.length - 1] ?? []
+    expect(afterKill.some((s: Session) => s.id === baseSession.id)).toBe(false)
+
+    // 3. Resolve the stale worker result (includes the killed session).
+    //    The generation guard should discard this and trigger a re-refresh.
+    replaceSessionsCalls = []
+    // Switch mock to immediate mode so the retry refresh completes
+    refreshWorkerDeferred = false
+    refreshWorkerSessions = [otherSession]
+    staleResolve!([baseSession, otherSession])
+    await new Promise((r) => setTimeout(r, 50))
+
+    // Stale result must not have been applied — killed session must not reappear
+    for (const call of replaceSessionsCalls) {
+      expect(call.some((s: Session) => s.id === baseSession.id)).toBe(false)
+    }
+    // Re-refresh must have fired and applied fresh data
+    expect(replaceSessionsCalls.length).toBeGreaterThan(0)
   })
 
   test('blocks remote kill when remoteAllowControl is false', async () => {

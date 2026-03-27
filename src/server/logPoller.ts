@@ -1,8 +1,8 @@
 import { logger } from './logger'
 import { config } from './config'
 import type { SessionDatabase } from './db'
-import { getLogSearchDirs } from './logDiscovery'
-import { DEFAULT_SCROLLBACK_LINES, extractLastEntryTimestamp, isToolNotificationText } from './logMatcher'
+import { getLogSearchDirs, normalizeProjectPath } from './logDiscovery'
+import { DEFAULT_SCROLLBACK_LINES, extractLastEntryTimestamp, isSameOrChildPath, isToolNotificationText } from './logMatcher'
 import { deriveDisplayName } from './agentSessions'
 import { generateUniqueSessionName } from './nameGenerator'
 import type { SessionRegistry } from './SessionRegistry'
@@ -368,6 +368,7 @@ export class LogPoller {
           this.db.updateSession(existing.sessionId, {
             currentWindow: match.tmuxWindow,
             displayName: window.name,
+            ...(window.command && !existing.launchCommand ? { launchCommand: window.command } : {}),
           })
           claimedWindows.add(match.tmuxWindow)
           matchedOrphanSessionIds.add(existing.sessionId)
@@ -414,6 +415,7 @@ export class LogPoller {
             this.db.updateSession(existing.sessionId, {
               currentWindow: window.tmuxWindow,
               displayName: window.name,
+              ...(window.command && !existing.launchCommand ? { launchCommand: window.command } : {}),
             })
             claimedWindows.add(window.tmuxWindow)
             unclaimedByName.delete(existing.displayName)
@@ -555,6 +557,19 @@ export class LogPoller {
       exactWindowMatches.set(match.logPath, window)
     }
 
+    // Build list of unclaimed, managed no-message windows for deferral checks.
+    // Only unclaimed managed windows can trigger deferral — external windows and
+    // windows already matched to a session are excluded to prevent unrelated blank
+    // windows from suppressing legitimate session insertions.
+    const deferralCandidates: Array<{ projectPath: string; agentType: string | null }> = []
+    for (const nmw of response.noMessageWindows ?? []) {
+      if (!nmw.projectPath) continue
+      if (nmw.source !== 'managed') continue
+      if (this.db.getSessionByWindow(nmw.tmuxWindow)) continue
+      const normalized = normalizeProjectPath(nmw.projectPath)
+      if (normalized) deferralCandidates.push({ projectPath: normalized, agentType: nmw.agentType })
+    }
+
     const entriesToMatch = getEntriesNeedingMatch(response.entries ?? [], sessions, {
       minTokens: MIN_LOG_TOKENS_FOR_INSERT,
       skipMatchingPatterns: config.skipMatchingPatterns,
@@ -603,6 +618,7 @@ export class LogPoller {
                   this.db.updateSession(existing.sessionId, {
                     currentWindow: exactMatch.tmuxWindow,
                     displayName: exactMatch.name,
+                    ...(exactMatch.command && !existing.launchCommand ? { launchCommand: exactMatch.command } : {}),
                   })
                   logger.info('session_rematched', {
                     sessionId: existing.sessionId,
@@ -679,6 +695,7 @@ export class LogPoller {
                   this.db.updateSession(sessionId, {
                     currentWindow: exactMatch.tmuxWindow,
                     displayName: exactMatch.name,
+                    ...(exactMatch.command && !existingById.launchCommand ? { launchCommand: exactMatch.command } : {}),
                   })
                   logger.info('session_rematched', {
                     sessionId,
@@ -766,6 +783,29 @@ export class LogPoller {
           }
         }
 
+        // Defer orphan insertion when the correct window may still be booting.
+        // Only defers when an unclaimed window with overlapping project path (and
+        // compatible agent type) has no extractable messages yet.
+        if (!currentWindow && projectPath && deferralCandidates.length > 0) {
+          const normalizedProject = normalizeProjectPath(projectPath)
+          if (normalizedProject) {
+            const hasBoot = deferralCandidates.some(
+              (c) =>
+                isSameOrChildPath(normalizedProject, c.projectPath) &&
+                (!c.agentType || !agentType || c.agentType === agentType)
+            )
+            if (hasBoot) {
+              logger.info('log_match_deferred', {
+                logPath: entry.logPath,
+                sessionId,
+                projectPath,
+                reason: 'no_message_window_booting',
+              })
+              continue
+            }
+          }
+        }
+
         let displayName = inheritDisplayName ?? deriveDisplayName(
           projectPath,
           sessionId,
@@ -794,6 +834,7 @@ export class LogPoller {
           lastResumeError: null,
           lastKnownLogSize: entry.size,
           isCodexExec: entry.isCodexExec,
+          launchCommand: matchedWindow?.command ?? null,
         })
         newSessions += 1
         if (currentWindow) {

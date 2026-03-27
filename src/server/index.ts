@@ -33,6 +33,7 @@ import {
   type DirectoryListing,
   type DirectoryErrorResponse,
   type AgentSession,
+  type AgentType,
   type HostStatus,
   type ResumeError,
   type Session,
@@ -63,7 +64,9 @@ import {
 function checkPortAvailable(port: number): void {
   let result: ReturnType<typeof Bun.spawnSync>
   try {
-    result = Bun.spawnSync(['lsof', '-i', `:${port}`, '-t'], {
+    // Use -sTCP:LISTEN to only match processes actually listening on the port,
+    // not stale/closed connections from other processes (e.g. Playwright/Chrome)
+    result = Bun.spawnSync(['lsof', '-i', `:${port}`, '-sTCP:LISTEN', '-t'], {
       stdout: 'pipe',
       stderr: 'pipe',
     })
@@ -388,12 +391,14 @@ const LAST_USER_MESSAGE_LOCK_MS = 60_000 // 60 seconds
 
 const logPoller = new LogPoller(db, registry, {
   onSessionOrphaned: (sessionId, supersededBy) => {
+    updateInactiveAgentSessions()
     const session = db.getSessionById(sessionId)
     if (session) {
       broadcast({ type: 'session-orphaned', session: toAgentSession(session), supersededBy })
     }
   },
   onSessionActivated: (sessionId, window) => {
+    updateInactiveAgentSessions()
     const session = db.getSessionById(sessionId)
     if (session) {
       broadcast({
@@ -412,11 +417,15 @@ const logPoller = new LogPoller(db, registry, {
 })
 const sessionRefreshWorker = new SessionRefreshWorkerClient()
 
-function updateAgentSessions() {
+// Active sessions update on every refresh — cheap (few rows).
+// Inactive sessions query is expensive — only run on actual mutations.
+function updateActiveAgentSessions() {
   const active = db.getActiveSessions().map(toAgentSession)
+  registry.setAgentSessions(active, registry.getAgentSessions().inactive)
+}
+
+function updateInactiveAgentSessions() {
   let inactive = db.getInactiveSessions({ maxAgeHours: runtimeInactiveMaxAgeHours }).map(toAgentSession)
-  // Filter out sessions from excluded project directories
-  // Use "<empty>" as a special marker to exclude sessions with no project path
   if (config.excludeProjects?.length > 0) {
     inactive = inactive.filter((session) => {
       const projectPath = session.projectPath || ''
@@ -426,6 +435,7 @@ function updateAgentSessions() {
       })
     })
   }
+  const active = db.getActiveSessions().map(toAgentSession)
   registry.setAgentSessions(active, inactive)
 }
 
@@ -661,34 +671,52 @@ function hydrateSessionsWithAgentSessions(
     for (const session of orphaned) {
       broadcast({ type: 'session-orphaned', session })
     }
+    updateInactiveAgentSessions()
+  } else {
+    updateActiveAgentSessions()
   }
-
-  updateAgentSessions()
   return hydrated
 }
 
 let refreshInFlight = false
+// Bumped on optimistic registry mutations (kill, create, resume) so
+// in-flight refreshes that started before the mutation discard their stale
+// window list instead of reverting the optimistic update.
+let refreshGeneration = 0
 
 async function refreshSessionsAsync(): Promise<void> {
   if (refreshInFlight) return
   refreshInFlight = true
   try {
-    const sessions = await sessionRefreshWorker.refresh(
-      config.tmuxSession,
-      config.discoverPrefixes
-    )
-    const hydrated = hydrateSessionsWithAgentSessions(sessions)
-    const withOverrides = applyForceWorkingOverrides(hydrated)
-    registry.replaceSessions(mergeRemoteSessions(withOverrides))
-  } catch (error) {
-    // Fallback to sync on worker failure
-    logger.warn('session_refresh_worker_error', {
-      message: error instanceof Error ? error.message : String(error),
-    })
-    const sessions = sessionManager.listWindows()
-    const hydrated = hydrateSessionsWithAgentSessions(sessions)
-    const withOverrides = applyForceWorkingOverrides(hydrated)
-    registry.replaceSessions(mergeRemoteSessions(withOverrides))
+    // Loop: retry once if an optimistic mutation invalidated our snapshot.
+    // At most one retry — if another mutation lands during the retry,
+    // the next scheduled refresh will pick it up.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const gen = refreshGeneration
+      try {
+        const sessions = await sessionRefreshWorker.refresh(
+          config.tmuxSession,
+          config.discoverPrefixes
+        )
+        // Mutation happened while we were listing windows — discard and retry
+        if (gen !== refreshGeneration) continue
+        const hydrated = hydrateSessionsWithAgentSessions(sessions)
+        const withOverrides = applyForceWorkingOverrides(hydrated)
+        registry.replaceSessions(mergeRemoteSessions(withOverrides))
+        return
+      } catch (error) {
+        // Fallback to sync on worker failure — sync listWindows sees
+        // post-mutation state so no generation check needed here.
+        logger.warn('session_refresh_worker_error', {
+          message: error instanceof Error ? error.message : String(error),
+        })
+        const sessions = sessionManager.listWindows()
+        const hydrated = hydrateSessionsWithAgentSessions(sessions)
+        const withOverrides = applyForceWorkingOverrides(hydrated)
+        registry.replaceSessions(mergeRemoteSessions(withOverrides))
+        return
+      }
+    }
   } finally {
     refreshInFlight = false
   }
@@ -755,7 +783,7 @@ async function captureLastUserMessage(tmuxWindow: string) {
     const updated = db.updateSession(record.sessionId, { lastUserMessage: message })
     if (!updated) return
     registry.updateSession(tmuxWindow, { lastUserMessage: message })
-    updateAgentSessions()
+    updateActiveAgentSessions()
   } catch (error) {
     logger.warn('last_user_message_capture_error', {
       tmuxWindow,
@@ -837,6 +865,10 @@ async function completeStartupVerification(): Promise<void> {
     resurrectPinnedSessions()
     refreshSessionsSync()
   }
+
+  // Load inactive sessions after startup verification and resurrection
+  // so the list reflects the final active/inactive split.
+  updateInactiveAgentSessions()
 }
 
 registry.on('session-update', (session) => {
@@ -853,6 +885,10 @@ registry.on('session-removed', (sessionId) => {
 
 registry.on('agent-sessions', ({ active, inactive }) => {
   broadcast({ type: 'agent-sessions', active, inactive })
+})
+
+registry.on('agent-sessions-active', (active) => {
+  broadcast({ type: 'agent-sessions-active', active })
 })
 
 app.post('/api/client-log', async (c) => {
@@ -1101,7 +1137,7 @@ app.put('/api/settings/inactive-max-age-hours', async (c) => {
     runtimeInactiveMaxAgeHours = hours
     db.setAppSetting(INACTIVE_MAX_AGE_HOURS_KEY, String(hours))
     // Re-broadcast agent sessions with new max age
-    updateAgentSessions()
+    updateInactiveAgentSessions()
     return c.json({ hours })
   } catch {
     return c.json({ error: 'Invalid request body' }, 400)
@@ -1340,6 +1376,7 @@ function handleMessage(
             message.command
           ))
           // Add session to registry immediately so terminal can attach
+          refreshGeneration++
           const currentSessions = registry.getAll()
           registry.replaceSessions([created, ...currentSessions])
           refreshSessions()
@@ -1647,6 +1684,8 @@ async function handleKill(sessionId: string, ws: ServerWebSocket<WSData>) {
 
   try {
     sessionManager.killWindow(session.tmuxWindow)
+    // Bump generation so any in-flight refresh discards its stale result
+    refreshGeneration++
     const orphaned = new Map<string, AgentSession>()
     const orphanById = (agentSessionId?: string | null) => {
       if (!agentSessionId || orphaned.has(agentSessionId)) return
@@ -1662,7 +1701,7 @@ async function handleKill(sessionId: string, ws: ServerWebSocket<WSData>) {
       orphanById(recordByWindow.sessionId)
     }
     if (orphaned.size > 0) {
-      updateAgentSessions()
+      updateInactiveAgentSessions()
       for (const orphanedSession of orphaned.values()) {
         broadcast({ type: 'session-orphaned', session: orphanedSession })
       }
@@ -1786,7 +1825,51 @@ function handleSessionPin(
     }
   }
 
-  updateAgentSessions()
+  updateInactiveAgentSessions()
+}
+
+/**
+ * Build a resume command by injecting stored launch flags into the resume template.
+ * e.g. stored "claude --dangerously-skip-permissions" + template "claude --resume {sessionId}"
+ *   → "claude --dangerously-skip-permissions --resume <id>"
+ * e.g. stored "codex --yolo --search" + template "codex resume {sessionId}"
+ *   → "codex --yolo --search resume <id>"
+ */
+function buildResumeCommand(
+  launchCommand: string | null,
+  sessionId: string,
+  agentType: AgentType
+): string {
+  const resumeTemplate =
+    agentType === 'claude' || agentType === 'claude-rp'
+      ? config.claudeResumeCmd
+      : config.codexResumeCmd
+
+  const baseResumeCmd = resumeTemplate.replace('{sessionId}', sessionId)
+
+  if (!launchCommand) {
+    return baseResumeCmd
+  }
+
+  // Extract flags from the stored command: strip the executable (first token)
+  // and any existing resume subcommand/flag + its session ID argument.
+  const flags = launchCommand
+    .trim()
+    .replace(/^\S+\s*/, '')             // strip executable
+    .replace(/--resume\s+\S+/g, '')     // strip --resume <id> (Claude)
+    .replace(/\bresume\s+\S+/g, '')     // strip resume <id> (Codex subcommand)
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (!flags) {
+    return baseResumeCmd
+  }
+
+  // Inject flags after the executable in the resume command
+  const firstSpace = baseResumeCmd.indexOf(' ')
+  const exe = baseResumeCmd.slice(0, firstSpace)
+  const rest = baseResumeCmd.slice(firstSpace + 1)
+  return `${exe} ${flags} ${rest}`
 }
 
 function resurrectPinnedSessions() {
@@ -1815,28 +1898,7 @@ function resurrectPinnedSessions() {
       continue
     }
 
-    const resumeTemplate =
-      record.agentType === 'claude' ? config.claudeResumeCmd : config.codexResumeCmd
-
-    // Validate template contains {sessionId} placeholder
-    if (!resumeTemplate.includes('{sessionId}')) {
-      const errorMsg = `Resume command template missing {sessionId} placeholder: ${resumeTemplate}`
-      db.updateSession(record.sessionId, { isPinned: false, lastResumeError: errorMsg })
-      broadcast({
-        type: 'session-resurrection-failed',
-        sessionId: record.sessionId,
-        displayName: record.displayName,
-        error: errorMsg,
-      })
-      logger.error('resurrect_pinned_session_invalid_template', {
-        sessionId: record.sessionId,
-        displayName: record.displayName,
-        template: resumeTemplate,
-      })
-      continue
-    }
-
-    const command = resumeTemplate.replace('{sessionId}', record.sessionId)
+    const command = buildResumeCommand(record.launchCommand, record.sessionId, record.agentType)
     const projectPath =
       record.projectPath ||
       process.env.HOME ||
@@ -1913,20 +1975,23 @@ function handleSessionResume(
     return
   }
 
-  const resumeTemplate =
-    record.agentType === 'claude' ? config.claudeResumeCmd : config.codexResumeCmd
-
-  // Validate template contains {sessionId} placeholder
-  if (!resumeTemplate.includes('{sessionId}')) {
-    const error: ResumeError = {
-      code: 'RESUME_FAILED',
-      message: `Resume command template missing {sessionId} placeholder`,
+  // Validate template when falling back to global config (no stored launch command)
+  if (!record.launchCommand) {
+    const resumeTemplate =
+      record.agentType === 'claude' || record.agentType === 'claude-rp'
+        ? config.claudeResumeCmd
+        : config.codexResumeCmd
+    if (!resumeTemplate.includes('{sessionId}')) {
+      const error: ResumeError = {
+        code: 'RESUME_FAILED',
+        message: 'Resume command template missing {sessionId} placeholder',
+      }
+      send(ws, { type: 'session-resume-result', sessionId, ok: false, error })
+      return
     }
-    send(ws, { type: 'session-resume-result', sessionId, ok: false, error })
-    return
   }
 
-  const command = resumeTemplate.replace('{sessionId}', sessionId)
+  const command = buildResumeCommand(record.launchCommand, sessionId, record.agentType)
   const projectPath =
     record.projectPath ||
     process.env.HOME ||
@@ -1947,8 +2012,10 @@ function handleSessionResume(
     })
     // Add session to registry immediately so terminal can attach
     // (async refresh will update with any additional data later)
+    refreshGeneration++
     const currentSessions = registry.getAll()
     registry.replaceSessions([created, ...currentSessions])
+    updateInactiveAgentSessions()
     refreshSessions()
     send(ws, { type: 'session-resume-result', sessionId, ok: true, session: created })
     broadcast({

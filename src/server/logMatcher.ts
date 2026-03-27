@@ -716,7 +716,7 @@ function normalizePath(value: string): string {
   return normalizeProjectPath(value)
 }
 
-function isSameOrChildPath(left: string, right: string): boolean {
+export function isSameOrChildPath(left: string, right: string): boolean {
   if (!left || !right) return false
   if (left === right) return true
   return left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
@@ -1240,30 +1240,46 @@ export function getTerminalScrollback(
   tmuxWindow: string,
   lines = DEFAULT_SCROLLBACK_LINES
 ): string {
+  return captureTerminalScrollback(tmuxWindow, lines).content
+}
+
+/** Capture terminal scrollback with success/failure indicator. */
+export function captureTerminalScrollback(
+  tmuxWindow: string,
+  lines = DEFAULT_SCROLLBACK_LINES
+): { ok: boolean; content: string } {
   const safeLines = Math.max(1, lines)
   const result = runCommandSync(
     ['tmux', 'capture-pane', '-t', tmuxWindow, '-p', '-J', '-S', `-${safeLines}`],
     { timeoutMs: TMUX_CAPTURE_TIMEOUT_MS }
   )
   if (result.exitCode !== 0) {
-    return ''
+    return { ok: false, content: '' }
   }
-  return result.stdout
+  return { ok: true, content: result.stdout }
 }
 
 export async function getTerminalScrollbackAsync(
   tmuxWindow: string,
   lines = DEFAULT_SCROLLBACK_LINES
 ): Promise<string> {
+  return (await captureTerminalScrollbackAsync(tmuxWindow, lines)).content
+}
+
+/** Async capture terminal scrollback with success/failure indicator. */
+export async function captureTerminalScrollbackAsync(
+  tmuxWindow: string,
+  lines = DEFAULT_SCROLLBACK_LINES
+): Promise<{ ok: boolean; content: string }> {
   const safeLines = Math.max(1, lines)
   const result = await runCommandAsync(
     ['tmux', 'capture-pane', '-t', tmuxWindow, '-p', '-J', '-S', `-${safeLines}`],
     { timeoutMs: TMUX_CAPTURE_TIMEOUT_MS }
   )
   if (result.exitCode !== 0) {
-    return ''
+    return { ok: false, content: '' }
   }
-  return result.stdout
+  return { ok: true, content: result.stdout }
 }
 
 /**
@@ -1551,17 +1567,24 @@ export interface ExactMatchResult {
  * 2. rg search for the longest messages → get candidate logs
  * 3. Narrow down with agent type/project path if available
  * 4. Break ties by ordered user-message matches in the log
+ *
+ * @param noMessageWindows Optional set to track windows that returned null because
+ *   the terminal had no extractable messages (empty or still booting). Windows that
+ *   have messages but fail matching for other reasons (short messages without
+ *   disambiguators, no candidates, tie, score=0) are NOT added to this set.
  */
 export function tryExactMatchWindowToLog(
   tmuxWindow: string,
   logDirs: string | string[],
   scrollbackLines = DEFAULT_SCROLLBACK_LINES,
   context: ExactMatchContext = {},
-  search: ExactMatchSearchOptions = {}
+  search: ExactMatchSearchOptions = {},
+  noMessageWindows?: Set<string>
 ): ExactMatchResult | null {
   const profile = search.profile
   const tmuxStart = performance.now()
-  const scrollback = getTerminalScrollback(tmuxWindow, scrollbackLines)
+  const captureResult = captureTerminalScrollback(tmuxWindow, scrollbackLines)
+  const scrollback = captureResult.content
   if (profile) {
     profile.tmuxCaptures += 1
     profile.tmuxCaptureMs += performance.now() - tmuxStart
@@ -1584,7 +1607,12 @@ export function tryExactMatchWindowToLog(
   let usingTraceFallback = false
   if (messages.length === 0) {
     const traces = extractRecentTraceLinesFromTmux(scrollback)
-    if (traces.length === 0) return null
+    if (traces.length === 0) {
+      // Only mark as "no messages" if the capture succeeded — a capture failure
+      // (stale/invalid tmux target) should not trigger deferral.
+      if (captureResult.ok) noMessageWindows?.add(tmuxWindow)
+      return null
+    }
     messages = traces
     usingTraceFallback = true
   }
@@ -1596,7 +1624,7 @@ export function tryExactMatchWindowToLog(
   const allowShortMessages = hasDisambiguators || usingTraceFallback
   const messagesToSearch =
     longMessages.length > 0 ? longMessages : allowShortMessages ? messages : []
-  if (messagesToSearch.length === 0) return null
+  if (messagesToSearch.length === 0) return null  // has messages, but too short — not booting
 
   const sortedMessages = messagesToSearch.toSorted((a, b) => b.length - a.length)
   let candidates: string[] = []
@@ -1754,11 +1782,13 @@ export async function tryExactMatchWindowToLogAsync(
   logDirs: string | string[],
   scrollbackLines = DEFAULT_SCROLLBACK_LINES,
   context: ExactMatchContext = {},
-  search: ExactMatchSearchOptions = {}
+  search: ExactMatchSearchOptions = {},
+  noMessageWindows?: Set<string>
 ): Promise<ExactMatchResult | null> {
   const profile = search.profile
   const tmuxStart = performance.now()
-  const scrollback = await getTerminalScrollbackAsync(tmuxWindow, scrollbackLines)
+  const captureResult = await captureTerminalScrollbackAsync(tmuxWindow, scrollbackLines)
+  const scrollback = captureResult.content
   if (profile) {
     profile.tmuxCaptures += 1
     profile.tmuxCaptureMs += performance.now() - tmuxStart
@@ -1783,7 +1813,10 @@ export async function tryExactMatchWindowToLogAsync(
   let usingTraceFallback = false
   if (messages.length === 0) {
     const traces = extractRecentTraceLinesFromTmux(scrollback)
-    if (traces.length === 0) return null
+    if (traces.length === 0) {
+      if (captureResult.ok) noMessageWindows?.add(tmuxWindow)
+      return null
+    }
     messages = traces
     usingTraceFallback = true
   }
@@ -1959,17 +1992,24 @@ export async function tryExactMatchWindowToLogAsync(
   }
 }
 
+export interface ExactMatchRgResult {
+  matches: Map<string, Session>
+  /** Windows where tryExactMatchWindowToLog returned null due to no extractable messages */
+  noMessageWindows: Set<string>
+}
+
 export function matchWindowsToLogsByExactRg(
   windows: Session[],
   logDirs: string | string[],
   scrollbackLines = DEFAULT_SCROLLBACK_LINES,
   search: ExactMatchSearchOptions = {}
-): Map<string, Session> {
+): ExactMatchRgResult {
   const matches = new Map<
     string,
     { window: Session; score: OrderedMatchScore }
   >()
   const blocked = new Set<string>()
+  const noMessageWindows = new Set<string>()
   const profile = search.profile
 
   for (const window of windows) {
@@ -1979,7 +2019,8 @@ export function matchWindowsToLogsByExactRg(
       logDirs,
       scrollbackLines,
       { agentType: window.agentType, projectPath: window.projectPath },
-      search
+      search,
+      noMessageWindows
     )
     if (profile) {
       profile.windowMatchRuns += 1
@@ -2017,7 +2058,7 @@ export function matchWindowsToLogsByExactRg(
     resolved.set(logPath, entry.window)
   }
 
-  return resolved
+  return { matches: resolved, noMessageWindows }
 }
 
 export async function matchWindowsToLogsByExactRgAsync(
@@ -2025,9 +2066,10 @@ export async function matchWindowsToLogsByExactRgAsync(
   logDirs: string | string[],
   scrollbackLines = DEFAULT_SCROLLBACK_LINES,
   search: ExactMatchSearchOptions = {}
-): Promise<Map<string, Session>> {
+): Promise<ExactMatchRgResult> {
   const matches = new Map<string, { window: Session; score: OrderedMatchScore }>()
   const blocked = new Set<string>()
+  const noMessageWindows = new Set<string>()
   const profile = search.profile
 
   const windowResults = await Promise.all(
@@ -2038,7 +2080,8 @@ export async function matchWindowsToLogsByExactRgAsync(
         logDirs,
         scrollbackLines,
         { agentType: window.agentType, projectPath: window.projectPath },
-        search
+        search,
+        noMessageWindows
       )
       return {
         window,
@@ -2085,7 +2128,7 @@ export async function matchWindowsToLogsByExactRgAsync(
     resolved.set(logPath, entry.window)
   }
 
-  return resolved
+  return { matches: resolved, noMessageWindows }
 }
 
 export interface VerifyWindowLogOptions {

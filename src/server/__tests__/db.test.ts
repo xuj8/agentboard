@@ -23,6 +23,7 @@ function makeSession(overrides: Partial<{
   lastResumeError: string | null
   lastKnownLogSize: number | null
   isCodexExec: boolean
+  launchCommand: string | null
 }> = {}) {
   return {
     sessionId: 'session-abc',
@@ -39,6 +40,7 @@ function makeSession(overrides: Partial<{
     lastResumeError: null,
     lastKnownLogSize: null,
     isCodexExec: false,
+    launchCommand: null,
     ...overrides,
   }
 }
@@ -190,6 +192,125 @@ describe('db', () => {
 
     migrated.close()
     fs.rmSync(tempDir, { recursive: true, force: true })
+  })
+
+  test('launchCommand is stored and retrieved', () => {
+    const session = makeSession({
+      sessionId: 'launch-cmd-test',
+      logFilePath: '/tmp/launch-cmd.jsonl',
+      launchCommand: 'claude --dangerously-skip-permissions',
+    })
+    const inserted = db.insertSession(session)
+    expect(inserted.launchCommand).toBe('claude --dangerously-skip-permissions')
+
+    const fetched = db.getSessionById('launch-cmd-test')
+    expect(fetched?.launchCommand).toBe('claude --dangerously-skip-permissions')
+
+    // Update launchCommand
+    const updated = db.updateSession('launch-cmd-test', {
+      launchCommand: 'claude --model opus --dangerously-skip-permissions',
+    })
+    expect(updated?.launchCommand).toBe('claude --model opus --dangerously-skip-permissions')
+
+    // Null launchCommand (default)
+    const session2 = makeSession({
+      sessionId: 'no-launch-cmd',
+      logFilePath: '/tmp/no-launch-cmd.jsonl',
+      launchCommand: null,
+    })
+    const inserted2 = db.insertSession(session2)
+    expect(inserted2.launchCommand).toBeNull()
+  })
+
+  test('getActiveSessions returns results in deterministic order by session_id', () => {
+    // Insert sessions with session_ids that would sort differently than insertion order
+    db.insertSession(makeSession({
+      sessionId: 'zebra',
+      logFilePath: '/tmp/zebra.jsonl',
+      displayName: 'zebra',
+      currentWindow: 'agentboard:3',
+    }))
+    db.insertSession(makeSession({
+      sessionId: 'alpha',
+      logFilePath: '/tmp/alpha.jsonl',
+      displayName: 'alpha',
+      currentWindow: 'agentboard:1',
+    }))
+    db.insertSession(makeSession({
+      sessionId: 'middle',
+      logFilePath: '/tmp/middle.jsonl',
+      displayName: 'middle',
+      currentWindow: 'agentboard:2',
+    }))
+
+    const active = db.getActiveSessions()
+    expect(active).toHaveLength(3)
+    expect(active[0].sessionId).toBe('alpha')
+    expect(active[1].sessionId).toBe('middle')
+    expect(active[2].sessionId).toBe('zebra')
+  })
+
+  test('getInactiveSessions returns results ordered by last_activity_at DESC with session_id tiebreaker', () => {
+    const recent = '2026-01-02T00:00:00.000Z'
+    const older = '2026-01-01T00:00:00.000Z'
+
+    // Two sessions with the same last_activity_at to test the tiebreaker
+    db.insertSession(makeSession({
+      sessionId: 'tie-zebra',
+      logFilePath: '/tmp/tie-zebra.jsonl',
+      displayName: 'tie-zebra',
+      currentWindow: null,
+      lastActivityAt: older,
+    }))
+    db.insertSession(makeSession({
+      sessionId: 'tie-alpha',
+      logFilePath: '/tmp/tie-alpha.jsonl',
+      displayName: 'tie-alpha',
+      currentWindow: null,
+      lastActivityAt: older,
+    }))
+    // One session with more recent activity (should come first)
+    db.insertSession(makeSession({
+      sessionId: 'recent-one',
+      logFilePath: '/tmp/recent.jsonl',
+      displayName: 'recent',
+      currentWindow: null,
+      lastActivityAt: recent,
+    }))
+
+    const inactive = db.getInactiveSessions()
+    expect(inactive).toHaveLength(3)
+    // Most recent activity first
+    expect(inactive[0].sessionId).toBe('recent-one')
+    // Same activity timestamp: alphabetical session_id tiebreaker
+    expect(inactive[1].sessionId).toBe('tie-alpha')
+    expect(inactive[2].sessionId).toBe('tie-zebra')
+  })
+
+  test('getInactiveSessions with maxAgeHours also uses session_id tiebreaker', () => {
+    const now = new Date()
+    const recentTime = new Date(now.getTime() - 30 * 60 * 1000).toISOString() // 30 min ago
+
+    db.insertSession(makeSession({
+      sessionId: 'age-zebra',
+      logFilePath: '/tmp/age-zebra.jsonl',
+      displayName: 'age-zebra',
+      currentWindow: null,
+      lastActivityAt: recentTime,
+    }))
+    db.insertSession(makeSession({
+      sessionId: 'age-alpha',
+      logFilePath: '/tmp/age-alpha.jsonl',
+      displayName: 'age-alpha',
+      currentWindow: null,
+      lastActivityAt: recentTime,
+    }))
+
+    const inactive = db.getInactiveSessions({ maxAgeHours: 1 })
+    expect(inactive).toHaveLength(2)
+    // Same timestamp: alphabetical session_id tiebreaker
+    expect(inactive[0].sessionId).toBe('age-alpha')
+    expect(inactive[1].sessionId).toBe('age-zebra')
   })
 
   test('app settings get/set', () => {
