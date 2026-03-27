@@ -44,16 +44,36 @@ async function main() {
   }
 
   try {
+    // Tests that either mutate globals or are sensitive to global mutations
+    // must run in a separate process so they don't race with other test files.
+    // PipePaneTerminalProxy reads Bun.spawnSync at construction time — if another
+    // test file has patched it, the proxy gets a mock and start() becomes undefined.
+    const ISOLATED_FILES = new Set([
+      'sessionRefreshWorker.test.ts',
+      'pipePaneTerminalProxy.test.ts',
+    ])
+
     const serverTests: string[] = []
     const serverGlob = new Bun.Glob('src/server/__tests__/*.test.ts')
     for await (const file of serverGlob.scan({ onlyFiles: true })) {
-      serverTests.push(file)
+      if (!ISOLATED_FILES.has(path.basename(file))) {
+        serverTests.push(file)
+      }
     }
     const sharedTestsDir = 'src/shared/__tests__'
     const clientTestsDir = 'src/client/__tests__'
 
     await runCommand(
       ['bun', 'test', ...passthroughArgs, ...serverTests, sharedTestsDir, clientTestsDir],
+      env
+    )
+
+    // Always run global-mutating tests in a separate process to prevent races.
+    const isolatedFiles = Array.from(ISOLATED_FILES).map(
+      (f) => `src/server/__tests__/${f}`
+    )
+    await runCommand(
+      ['bun', 'test', ...passthroughArgs, ...isolatedFiles],
       env
     )
 
