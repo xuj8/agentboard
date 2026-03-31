@@ -987,13 +987,17 @@ export function useTerminal({
 
       const isSessionSwitch = prevAttached !== null && prevAttached !== sessionId
 
+      // Session switch (e.g. after kill): use microtask so the message is sent
+      // after the current React commit phase but before the browser yields to
+      // new tasks — cannot be cancelled by effect cleanup unlike setTimeout.
+      // Reconnection / epoch change: use 50ms debounce to deduplicate rapid
+      // re-attaches from rapid epoch changes.
       if (isSessionSwitch) {
-        // Session switch (e.g. after kill): send immediately — no debounce
-        // needed since the user can't switch sessions faster than React renders.
-        sendMessageRef.current(attachMsg)
-        sendMessageRef.current({ type: 'tmux-check-copy-mode', sessionId })
+        queueMicrotask(() => {
+          sendMessageRef.current(attachMsg)
+          sendMessageRef.current({ type: 'tmux-check-copy-mode', sessionId })
+        })
       } else {
-        // Reconnection / epoch change: debounce to deduplicate rapid re-attaches
         attachDebounceRef.current = window.setTimeout(() => {
           attachDebounceRef.current = null
           sendMessageRef.current(attachMsg)
