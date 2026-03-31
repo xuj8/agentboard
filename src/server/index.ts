@@ -702,9 +702,17 @@ async function refreshSessionsAsync(): Promise<void> {
         )
         // Mutation happened while we were listing windows — discard and retry
         if (gen !== refreshGeneration) continue
+        // Yield before blocking SQLite work so pending WebSocket buffers flush
+        await new Promise<void>((resolve) => setTimeout(resolve, 0))
+        if (gen !== refreshGeneration) continue
+        const tHydrate = performance.now()
         const hydrated = hydrateSessionsWithAgentSessions(sessions)
         const withOverrides = applyForceWorkingOverrides(hydrated)
         registry.replaceSessions(mergeRemoteSessions(withOverrides))
+        const hydrateMs = Math.round(performance.now() - tHydrate)
+        if (hydrateMs > 50) {
+          logger.debug('session_refresh_hydrate_slow', { hydrateMs, sessionCount: sessions.length })
+        }
         return
       } catch (error) {
         // Fallback to sync on worker failure — sync listWindows sees
