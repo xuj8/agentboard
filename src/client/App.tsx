@@ -17,7 +17,7 @@ import { useThemeStore } from './stores/themeStore'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useVisualViewport } from './hooks/useVisualViewport'
 import { sortSessions } from './utils/sessions'
-import { setClientLogLevel } from './utils/clientLog'
+import { clientLog, setClientLogLevel } from './utils/clientLog'
 import { getEffectiveModifier, matchesModifier } from './utils/device'
 import { playPermissionSound, playIdleSound, primeAudio, needsUserGesture } from './utils/sound'
 
@@ -451,6 +451,7 @@ export default function App() {
   const pendingKills = useRef<Map<string, { session: Session; wasSelected: boolean; epoch: number }>>(new Map())
 
   const handleKillSession = useCallback((sessionId: string) => {
+    const killStart = performance.now()
     // Snapshot session and selection state before removal for kill-failed rollback
     const { sessions: currentSessions, selectedSessionId: currentSelected } = useSessionStore.getState()
     const session = currentSessions.find(s => s.id === sessionId)
@@ -467,6 +468,11 @@ export default function App() {
     // even if the server's broadcast is lost (e.g. iOS Safari WS message drops)
     setSessions(currentSessions.filter(s => s.id !== sessionId))
     sendMessage({ type: 'session-kill', sessionId })
+    clientLog('kill_initiated', {
+      sessionId,
+      remainingSessions: currentSessions.length - 1,
+      durationMs: Math.round(performance.now() - killStart),
+    }, 'info')
   }, [markSessionExiting, setSessions, sendMessage])
 
   useEffect(() => {
