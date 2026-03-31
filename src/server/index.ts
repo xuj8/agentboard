@@ -229,6 +229,8 @@ interface WSData {
   connectionId: string
   terminalHost: string | null
   terminalAttachSeq: number
+  lastAttachKey: string | null
+  lastAttachTs: number
 }
 
 const sockets = new Set<ServerWebSocket<WSData>>()
@@ -1227,6 +1229,8 @@ Bun.serve<WSData>({
             connectionId: createConnectionId(),
             terminalHost: null,
             terminalAttachSeq: 0,
+            lastAttachKey: null,
+            lastAttachTs: 0,
           },
         })
       ) {
@@ -1296,6 +1300,7 @@ async function cleanupAllTerminals() {
     ws.data.currentSessionId = null
     ws.data.currentTmuxTarget = null
     ws.data.terminalHost = null
+    clearAttachDedup(ws)
   }
   await Promise.allSettled(disposePromises)
   logPoller.stop()
@@ -1311,6 +1316,12 @@ process.on('SIGTERM', () => {
   void cleanupAllTerminals().finally(() => process.exit(0))
 })
 
+/** Clear attach dedup state so a new/replacement proxy doesn't inherit stale history. */
+function clearAttachDedup(ws: ServerWebSocket<WSData>) {
+  ws.data.lastAttachKey = null
+  ws.data.lastAttachTs = 0
+}
+
 function cleanupTerminals(ws: ServerWebSocket<WSData>) {
   if (ws.data.terminal) {
     void ws.data.terminal.dispose()
@@ -1319,6 +1330,7 @@ function cleanupTerminals(ws: ServerWebSocket<WSData>) {
   ws.data.currentSessionId = null
   ws.data.currentTmuxTarget = null
   ws.data.terminalHost = null
+  clearAttachDedup(ws)
 }
 
 function broadcast(message: ServerMessage) {
@@ -2051,6 +2063,7 @@ function initializePersistentTerminal(ws: ServerWebSocket<WSData>) {
 
   void terminal.start().catch((error) => {
     ws.data.terminal = null
+    clearAttachDedup(ws)
     handleTerminalError(ws, null, error, 'ERR_TMUX_ATTACH_FAILED')
   })
 }
@@ -2079,6 +2092,7 @@ function createPersistentTerminal(ws: ServerWebSocket<WSData>) {
       ws.data.currentSessionId = null
       ws.data.currentTmuxTarget = null
       ws.data.terminal = null
+      clearAttachDedup(ws)
       void terminal.dispose()
       if (sockets.has(ws)) {
         sendTerminalError(
@@ -2127,6 +2141,7 @@ async function ensurePersistentTerminal(
   } catch (error) {
     if (ws.data.terminal === terminal) {
       ws.data.terminal = null
+      clearAttachDedup(ws)
     }
     throw error
   }
@@ -2161,6 +2176,7 @@ async function ensureCorrectProxyType(
         if (ws.data.terminal === terminal) {
           ws.data.terminal = null
           ws.data.terminalHost = null
+          clearAttachDedup(ws)
         }
         throw error
       }
@@ -2177,6 +2193,7 @@ async function ensureCorrectProxyType(
       ws.data.terminalHost = null
       ws.data.currentSessionId = null
       ws.data.currentTmuxTarget = null
+      clearAttachDedup(ws)
     }
     await oldTerminal.dispose()
   }
@@ -2228,6 +2245,7 @@ async function createAndStartSshProxy(
       ws.data.currentTmuxTarget = null
       ws.data.terminal = null
       ws.data.terminalHost = null
+      clearAttachDedup(ws)
       void terminal.dispose()
       if (sockets.has(ws)) {
         sendTerminalError(ws, sessionId, 'ERR_TMUX_ATTACH_FAILED', 'SSH tmux client exited', true)
@@ -2259,6 +2277,7 @@ async function createAndStartSshProxy(
     if (ws.data.terminal === terminal) {
       ws.data.terminal = null
       ws.data.terminalHost = null
+      clearAttachDedup(ws)
     }
     throw error
   }
@@ -2330,6 +2349,27 @@ async function attachTerminalPersistent(
 
   const effectiveTarget = terminal.resolveEffectiveTarget(target)
 
+  // Deduplicate rapid re-attaches to the same session+target (e.g. two
+  // terminal-attach messages arriving within ~34ms).  Skip the expensive
+  // scrollback capture and just acknowledge readiness.
+  const attachKey = `${sessionId}:${effectiveTarget}`
+  const now = performance.now()
+  const ATTACH_DEDUP_MS = 500
+
+  if (ws.data.lastAttachKey === attachKey &&
+      now - ws.data.lastAttachTs < ATTACH_DEDUP_MS) {
+    logger.debug('terminal_attach_dedup', {
+      sessionId, target, effectiveTarget, attachSeq,
+      elapsedMs: Math.round(now - ws.data.lastAttachTs),
+      connectionId: ws.data.connectionId,
+    })
+    // Still need to set currentSessionId so input works
+    ws.data.currentSessionId = sessionId
+    ws.data.currentTmuxTarget = effectiveTarget
+    send(ws, { type: 'terminal-ready', sessionId })
+    return
+  }
+
   // Capture scrollback history BEFORE switching to avoid race with live output
   const history = session.remote && session.host
     ? await captureTmuxHistoryRemote(effectiveTarget, session.host)
@@ -2346,18 +2386,29 @@ async function attachTerminalPersistent(
       if (!isTerminalAttachCurrent(ws, attachSeq)) return
       ws.data.currentSessionId = sessionId
       ws.data.currentTmuxTarget = effectiveTarget
-      // Send history in onReady callback, before output suppression is lifted
+      // Send history in chunks sized to fit TCP's initial congestion window
+      // (~14.6KB). On high-latency connections (5G/Tailscale), the first chunk
+      // arrives before slow start ramps up, letting the client render partial
+      // content immediately instead of waiting for the full payload.
       if (history) {
+        const HISTORY_CHUNK_SIZE = 12_000
         const tStr = performance.now()
-        const payload = JSON.stringify({ type: 'terminal-output', sessionId, data: history })
+        let totalBytes = 0
+        let chunks = 0
+        for (let offset = 0; offset < history.length; offset += HISTORY_CHUNK_SIZE) {
+          const chunk = history.slice(offset, offset + HISTORY_CHUNK_SIZE)
+          const payload = JSON.stringify({ type: 'terminal-output', sessionId, data: chunk })
+          ws.send(payload)
+          totalBytes += payload.length
+          chunks += 1
+        }
         const stringifyMs = Math.round(performance.now() - tStr)
-        const sendResult = ws.send(payload)
         logger.debug('terminal_history_send', {
           sessionId,
           stringifyMs,
-          payloadBytes: payload.length,
+          payloadBytes: totalBytes,
           historyChars: history.length,
-          sendResult,
+          chunks,
           connectionId: ws.data.connectionId,
         })
       }
@@ -2368,6 +2419,10 @@ async function attachTerminalPersistent(
     }
     ws.data.currentSessionId = sessionId
     ws.data.currentTmuxTarget = effectiveTarget
+    // Record dedup key only after successful switch — prevents a second
+    // attach from hitting the dedup fast-path while the first is still in flight.
+    ws.data.lastAttachKey = attachKey
+    ws.data.lastAttachTs = performance.now()
     logger.info('terminal_attach_profile', {
       sessionId,
       target,
@@ -2486,6 +2541,8 @@ function detachTerminalPersistent(ws: ServerWebSocket<WSData>, sessionId: string
     ws.data.currentSessionId = null
     ws.data.currentTmuxTarget = null
   }
+  // Clear dedup so a fast A→B→A switch doesn't skip scrollback for A
+  clearAttachDedup(ws)
 }
 
 function handleTerminalInputPersistent(

@@ -151,6 +151,7 @@ export function useTerminal({
   const isiOS = isIOSDevice()
   const containerRef = useRef<HTMLDivElement | null>(null)
   const terminalRef = useRef<Terminal | null>(null)
+  const hasLoggedInitRef = useRef(false)
   const fitAddonRef = useRef<FitAddon | null>(null)
   const webglAddonRef = useRef<WebglAddon | null>(null)
   const webLinksAddonRef = useRef<WebLinksAddon | null>(null)
@@ -161,6 +162,7 @@ export function useTerminal({
   const resizeTimer = useRef<number | null>(null)
   const scrollTimer = useRef<number | null>(null)
   const fitTimer = useRef<number | null>(null)
+  const attachDebounceRef = useRef<number | null>(null)
 
   // Wheel event handling for tmux scrollback
   const wheelAccumRef = useRef<number>(0)
@@ -210,11 +212,13 @@ export function useTerminal({
 
   // Schedule an iOS compositor repaint after delayMs.
   // Cancels any in-flight repaint first (safely restoring display).
-  const scheduleIosRepaint = (delayMs: number) => {
+  const scheduleIosRepaint = (delayMs: number, trigger?: string) => {
     const container = containerRef.current
     if (!container) return
 
     cancelIosRepaint()
+
+    clientLog('ios_repaint_schedule', { delayMs, trigger, sessionId: attachedSessionRef.current })
 
     iosRepaintTimerRef.current = window.setTimeout(() => {
       iosRepaintTimerRef.current = null
@@ -222,6 +226,15 @@ export function useTerminal({
       // fresh content before the compositor is forced to repaint.
       const terminal = terminalRef.current
       if (terminal) terminal.refresh(0, terminal.rows - 1)
+
+      const hasContent = terminal ? terminal.buffer.active.length > 0 : false
+      clientLog('ios_repaint_exec', {
+        trigger,
+        hasContent,
+        bufferLines: terminal?.buffer.active.length ?? 0,
+        sessionId: attachedSessionRef.current,
+      })
+
       iosRepaintPrevRef.current = container.style.display
       container.style.display = 'none'
       // Split restore across two animation frames so the compositor
@@ -368,6 +381,7 @@ export function useTerminal({
           // Dispose on context loss so xterm falls back to canvas renderer
           // instead of trying to render through a dead WebGL context (causes artifacts)
           webglAddon.onContextLoss(() => {
+            clientLog('webgl_context_loss', { sessionId }, 'info')
             try { webglAddon.dispose() } catch { /* ignore */ }
             webglAddonRef.current = null
           })
@@ -380,6 +394,18 @@ export function useTerminal({
 
       terminal.open(container)
       fitAddon.fit()
+
+      if (!hasLoggedInitRef.current) {
+        hasLoggedInitRef.current = true
+        clientLog('terminal_init', {
+          isiOS,
+          useWebGL: useWebGLRef.current,
+          hasWebGL: !!webglAddonRef.current,
+          userAgent: navigator.userAgent.slice(0, 120),
+          platform: navigator.platform,
+          maxTouchPoints: navigator.maxTouchPoints,
+        }, 'info')
+      }
 
       // Append tooltip after terminal.open() sets terminal.element
       if (tooltip && terminal.element) {
@@ -865,6 +891,10 @@ export function useTerminal({
     const prevTarget = attachedTargetRef.current
 
     if (!allowAttach) {
+      if (attachDebounceRef.current !== null) {
+        window.clearTimeout(attachDebounceRef.current)
+        attachDebounceRef.current = null
+      }
       if (prevAttached) {
         sendMessageRef.current({ type: 'terminal-detach', sessionId: prevAttached })
         attachedSessionRef.current = null
@@ -879,6 +909,10 @@ export function useTerminal({
     // Reattach when websocket comes back: server-side ws.currentSessionId is
     // cleared on disconnect, so input is ignored until a fresh terminal-attach.
     if (connectionStatus !== 'connected') {
+      if (attachDebounceRef.current !== null) {
+        window.clearTimeout(attachDebounceRef.current)
+        attachDebounceRef.current = null
+      }
       if (prevAttached) {
         clientLog('terminal_detach_on_disconnect', { connectionStatus, prevAttached })
         attachedSessionRef.current = null
@@ -926,21 +960,40 @@ export function useTerminal({
       }
       const fitDone = performance.now()
 
-      // Send attach message with current dimensions so server spawns at correct size
-      sendMessageRef.current({
-        type: 'terminal-attach',
-        sessionId,
-        tmuxTarget: tmuxTarget ?? undefined,
-        cols: terminal.cols,
-        rows: terminal.rows,
-      })
-      // Mark as attached
+      // Mark refs before the debounce so the output subscriber can match
+      // incoming messages to the correct session. Input is naturally suppressed
+      // during the debounce because terminal-input uses attachedSessionRef which
+      // won't reach the server until ws.data.currentSessionId is set by the
+      // server's terminal-attach handler.
       attachedSessionRef.current = sessionId
       attachedTargetRef.current = tmuxTarget ?? null
       attachedConnectionEpochRef.current = connectionEpoch
 
-      // Check if this session is already in copy-mode (scrolled back)
-      sendMessageRef.current({ type: 'tmux-check-copy-mode', sessionId })
+      // Store the start time so the output subscriber can measure end-to-end
+      switchStartRef.current = switchStart
+
+      // Cancel any pending attach from a rapid epoch change
+      if (attachDebounceRef.current !== null) {
+        window.clearTimeout(attachDebounceRef.current)
+        attachDebounceRef.current = null
+      }
+
+      const attachMsg = {
+        type: 'terminal-attach' as const,
+        sessionId,
+        tmuxTarget: tmuxTarget ?? undefined,
+        cols: terminal.cols,
+        rows: terminal.rows,
+      }
+
+      // Debounce the attach send: if epoch changes twice in rapid succession,
+      // only the last attach is sent, avoiding duplicate scrollback payloads.
+      attachDebounceRef.current = window.setTimeout(() => {
+        attachDebounceRef.current = null
+        sendMessageRef.current(attachMsg)
+        // Check if this session is already in copy-mode (scrolled back)
+        sendMessageRef.current({ type: 'tmux-check-copy-mode', sessionId })
+      }, 50)
 
       clientLog('switch_attach_sent', {
         sessionId,
@@ -949,9 +1002,6 @@ export function useTerminal({
         totalMs: Math.round(performance.now() - switchStart),
         from: prevAttached ?? null,
       })
-
-      // Store the start time so the output subscriber can measure end-to-end
-      switchStartRef.current = switchStart
 
       // Scroll to bottom and focus after content loads
       if (scrollTimer.current) {
@@ -980,11 +1030,23 @@ export function useTerminal({
         attachedEpoch,
       })
     }
-    // Handle deselection
+    // Handle deselection — cancel any pending debounced attach
     if (!sessionId && prevAttached) {
+      if (attachDebounceRef.current !== null) {
+        window.clearTimeout(attachDebounceRef.current)
+        attachDebounceRef.current = null
+      }
       attachedSessionRef.current = null
       attachedTargetRef.current = null
       attachedConnectionEpochRef.current = -1
+    }
+
+    // Cancel pending debounced attach on effect re-run or unmount
+    return () => {
+      if (attachDebounceRef.current !== null) {
+        window.clearTimeout(attachDebounceRef.current)
+        attachDebounceRef.current = null
+      }
     }
   }, [sessionId, tmuxTarget, allowAttach, connectionStatus, connectionEpoch, checkScrollPosition])
 
@@ -1014,6 +1076,13 @@ export function useTerminal({
         // Log slow writes (>50ms) to catch render bottlenecks
         if (writeMs > 50) {
           clientLog('switch_write_slow', {
+            sessionId: attachedSessionRef.current,
+            writeMs,
+            bytes: dataLen,
+          })
+        }
+        if (isiOS && writeMs > 50) {
+          clientLog('ios_write_slow', {
             sessionId: attachedSessionRef.current,
             writeMs,
             bytes: dataLen,
@@ -1087,7 +1156,7 @@ export function useTerminal({
         // visibility-triggered repaint (no double-flicker).
         if (isiOS) {
           flush()
-          scheduleIosRepaint(50)
+          scheduleIosRepaint(50, 'terminal-ready')
         }
       }
 
@@ -1146,33 +1215,89 @@ export function useTerminal({
   // iOS WKWebView shows a stale cached snapshot after background/foreground.
   // Uses shared scheduleIosRepaint/cancelIosRepaint so the visibility and
   // terminal-ready repaint paths can't interfere with each other.
+  //
+  // Also recreate WebGL context — iOS can silently kill it during background.
   useEffect(() => {
-    if (!isiOS) return
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return
+
+    // Log visibility changes unconditionally for diagnostics
+    const handleVisibilityDiag = () => {
+      if (document.visibilityState !== 'hidden') {
+        clientLog('terminal_visibility_resume', {
+          isiOS,
+          hasWebGL: !!webglAddonRef.current,
+          useWebGL: useWebGLRef.current,
+          hasTerminal: !!terminalRef.current,
+          bufferLines: terminalRef.current?.buffer.active.length ?? 0,
+          sessionId: attachedSessionRef.current,
+        }, 'info')
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibilityDiag)
+
+    if (!isiOS) {
+      return () => {
+        document.removeEventListener('visibilitychange', handleVisibilityDiag)
+      }
+    }
+
+    // iOS can silently kill the WebGL context during background without
+    // firing onContextLoss. Force-recreate the addon to get a fresh context.
+    // Without this, xterm renders through a dead WebGL context → blank screen.
+    // Called from multiple resume handlers because iOS doesn't reliably fire
+    // visibilitychange (WebKit #202399) — focus is often the only event.
+    const recreateWebGLIfNeeded = (trigger: string) => {
+      const terminal = terminalRef.current
+      if (terminal && webglAddonRef.current && useWebGLRef.current) {
+        try {
+          webglAddonRef.current.dispose()
+        } catch { /* ignore */ }
+        webglAddonRef.current = null
+        try {
+          const webglAddon = new WebglAddon()
+          webglAddon.onContextLoss(() => {
+            clientLog('webgl_context_loss', { sessionId: attachedSessionRef.current }, 'info')
+            try { webglAddon.dispose() } catch { /* ignore */ }
+            webglAddonRef.current = null
+          })
+          terminal.loadAddon(webglAddon)
+          webglAddonRef.current = webglAddon
+          clientLog('ios_webgl_recreated', { trigger }, 'info')
+        } catch {
+          clientLog('ios_webgl_recreate_failed', { trigger }, 'info')
+        }
+      }
+    }
 
     const handleVisibility = () => {
       // Skip hidden transitions. Don't require 'visible' specifically —
       // visibilityState can be wrong in iOS PWA standalone (WebKit #202399).
       if (document.visibilityState === 'hidden') return
-      scheduleIosRepaint(200)
+      recreateWebGLIfNeeded('visibilitychange')
+      scheduleIosRepaint(200, 'visibilitychange')
     }
 
     const handlePageShow = (e: PageTransitionEvent) => {
       // pageshow fires on BFCache/freeze restore — more reliable than
       // visibilitychange in iOS PWA standalone mode.
-      if (e.persisted) scheduleIosRepaint(200)
+      if (!e.persisted) return
+      recreateWebGLIfNeeded('pageshow')
+      scheduleIosRepaint(200, 'pageshow')
     }
 
     const handleFocus = () => {
       // Fallback: window 'focus' reliably fires when an iOS PWA returns
       // to the foreground, even when visibilitychange doesn't fire
       // (WebKit #202399) and the WebSocket stays alive (no reconnect).
-      scheduleIosRepaint(200)
+      recreateWebGLIfNeeded('focus')
+      scheduleIosRepaint(200, 'focus')
     }
 
     document.addEventListener('visibilitychange', handleVisibility)
     window.addEventListener('pageshow', handlePageShow)
     window.addEventListener('focus', handleFocus)
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityDiag)
       document.removeEventListener('visibilitychange', handleVisibility)
       window.removeEventListener('pageshow', handlePageShow)
       window.removeEventListener('focus', handleFocus)

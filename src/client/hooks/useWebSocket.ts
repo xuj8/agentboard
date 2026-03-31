@@ -29,7 +29,7 @@
  * - Leaked socket tracking (force-closes all prior sockets to avoid browser limits)
  * - Resume delay (waits for iOS to restore network before first connect attempt)
  */
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo } from 'react'
 import type { ClientMessage, SendClientMessage, ServerMessage, ServerMessageWithDiagnostics } from '@shared/types'
 import type { ConnectionStatus } from '../stores/sessionStore'
 import { useSessionStore } from '../stores/sessionStore'
@@ -116,6 +116,7 @@ export class WebSocketManager {
   private heartbeatTimer: number | null = null
   private pongTimer: number | null = null
   private lastForceReconnectTs = 0
+  private lastConnectTs = 0
   private pingSeq = 0
   private connectionEpoch = 0
   /** Consecutive connect attempts that failed (timeout, error, close). */
@@ -153,6 +154,14 @@ export class WebSocketManager {
         clientLog('ws_connect_skip', { reason: 'already_open', ...this.wsSnap() })
         return
       }
+      // Don't destroy a socket that's still connecting if connect() was called
+      // very recently — prevents rapid connect-destroy-connect cycles that
+      // cause two onopen events and double terminal-attach.
+      const now = Date.now()
+      if (this.ws.readyState === WebSocket.CONNECTING && now - this.lastConnectTs < 200) {
+        clientLog('ws_connect_skip', { reason: 'already_connecting', ...this.wsSnap() })
+        return
+      }
       clientLog('ws_connect_destroy_zombie', {
         reason: isOpen ? 'open_desynced' : 'not_open',
         ...this.wsSnap(),
@@ -170,6 +179,7 @@ export class WebSocketManager {
 
     const ws = new WebSocket(wsUrl)
     this.ws = ws
+    this.lastConnectTs = Date.now()
     this.leakedSockets.add(ws)
 
     // Use a longer timeout for the first attempt after resume — VPN tunnels
@@ -705,34 +715,26 @@ export class WebSocketManager {
 const manager = new WebSocketManager()
 
 export function useWebSocket() {
-  const setConnectionStatus = useSessionStore(
-    (state) => state.setConnectionStatus
-  )
-  const setConnectionError = useSessionStore(
-    (state) => state.setConnectionError
-  )
-  const [status, setStatus] = useState<ConnectionStatus>(
-    manager.getStatus()
-  )
-  const [connectionEpoch, setConnectionEpoch] = useState<number>(
-    manager.getConnectionEpoch()
+  const setConnectionState = useSessionStore(
+    (state) => state.setConnectionState
   )
 
   useEffect(() => {
     manager.connect()
     manager.startLifecycleListeners()
     const unsubscribe = manager.subscribeStatus((nextStatus, error, nextConnectionEpoch) => {
-      setStatus(nextStatus)
-      setConnectionEpoch(nextConnectionEpoch)
-      setConnectionStatus(nextStatus)
-      setConnectionError(error)
+      // Atomic Zustand update — connectionStatus and connectionEpoch land in the
+      // same store commit, so useTerminal sees both changes in a single render.
+      // Previously connectionEpoch was in React useState while connectionStatus
+      // was in Zustand, causing two renders and a double terminal-attach.
+      setConnectionState(nextStatus, error, nextConnectionEpoch)
     })
 
     return () => {
       unsubscribe()
       manager.stopLifecycleListeners()
     }
-  }, [setConnectionError, setConnectionStatus])
+  }, [setConnectionState])
 
   const sendMessage = useMemo<SendClientMessage>(
     () => (message) => { void manager.send(message) },
@@ -744,8 +746,6 @@ export function useWebSocket() {
   const getConnectionEpoch = useMemo(() => () => manager.getConnectionEpoch(), [])
 
   return {
-    status,
-    connectionEpoch,
     sendMessage,
     subscribe,
     getConnectionEpoch,
