@@ -2433,20 +2433,25 @@ async function attachTerminalPersistent(
         const tStr = performance.now()
         let totalBytes = 0
         let chunks = 0
+        let sendResults: number[] = []
         for (let offset = 0; offset < history.length; offset += HISTORY_CHUNK_SIZE) {
           const chunk = history.slice(offset, offset + HISTORY_CHUNK_SIZE)
           const payload = JSON.stringify({ type: 'terminal-output', sessionId, data: chunk })
-          ws.send(payload)
+          const sent = ws.send(payload)
+          sendResults.push(typeof sent === 'number' ? sent : sent ? 1 : 0)
           totalBytes += payload.length
           chunks += 1
         }
         const stringifyMs = Math.round(performance.now() - tStr)
+        const buffered = typeof ws.getBufferedAmount === 'function' ? ws.getBufferedAmount() : -1
         logger.debug('terminal_history_send', {
           sessionId,
           stringifyMs,
           payloadBytes: totalBytes,
           historyChars: history.length,
           chunks,
+          sendResults,
+          bufferedAfter: buffered,
           connectionId: ws.data.connectionId,
         })
       }
