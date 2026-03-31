@@ -2443,6 +2443,10 @@ async function attachTerminalPersistent(
         })
       }
     })
+    // Yield to flush WebSocket buffers immediately after sending history.
+    // Without this, Bun buffers the ws.send() data and doesn't flush until
+    // the event loop is free — which can be seconds if other sync work follows.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
     const tSwitch = performance.now()
     if (!isTerminalAttachCurrent(ws, attachSeq)) {
       return
