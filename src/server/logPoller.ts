@@ -874,6 +874,11 @@ export class LogPoller {
     }
     this.pollInFlight = true
     const start = Date.now()
+    logger.debug('log_poll_start', { timestamp: start })
+    // Yield the event loop before starting any blocking SQLite queries.
+    // This ensures pending WebSocket buffers are flushed to the network
+    // before the main thread is blocked by DB reads.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
     let workerErrors = 0
 
     try {
@@ -989,6 +994,9 @@ export class LogPoller {
           ...response.profile,
         })
       }
+
+      // Yield before processing DB writes so pending WebSocket data flushes
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
 
       const processed = response
         ? this.processMatchResponse(response, windows, sessionRecords)
